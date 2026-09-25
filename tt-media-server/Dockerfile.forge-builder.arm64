@@ -1,0 +1,259 @@
+# SPDX-License-Identifier: Apache-2.0
+#
+# SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
+
+# Builder for the aarch64 wheels that Dockerfile.forge.arm64 needs (pjrt-plugin-tt, torch-xla,
+# tt-lang). Phase 1 of docs/arm64-forge-image-plan.md. Build natively on an aarch64 host.
+#
+# Stages:
+#   builder   - build deps + Python 3.12 + bazelisk on top of the tt-metalium-release image.
+#               Stays on Ubuntu 22.04 (not upstream's 24.04) so the resulting binaries only need
+#               glibc 2.35 and run in the 22.04-based runtime image.
+#   toolchain - tt-mlir's pinned LLVM/MLIR/flatbuffers/StableHLO/Shardy toolchain, installed
+#               into /opt/ttmlir-toolchain (the `env/` build). Takes a while.
+#   pjrt-wheel - tt-xla (patched by patch_tt_xla.py) built into pjrt_plugin_tt + vllm_tt
+#               wheels in /wheels.
+#   torch-xla-wheel - Tenstorrent's pytorch-xla fork (Bazel), built against the official
+#               aarch64 torch wheel. FROM builder, independent of the tt-mlir stages.
+#   wheels    - scratch stage holding only the wheels, for `--output`.
+#
+# The build context is tt-media-server/scripts/forge_arm64 (only patch_tt_xla.py is needed).
+# Exact commands used, with timings: docs/arm64-forge-build-log.md
+#
+#   docker build -f tt-media-server/Dockerfile.forge-builder.arm64 --target wheels \
+#     --output type=local,dest=tt-media-server/wheels tt-media-server/scripts/forge_arm64
+ARG BASE_IMAGE=tt-metalium-release:local
+
+#============================================================================
+# builder
+#============================================================================
+FROM ${BASE_IMAGE} AS builder
+SHELL ["/bin/bash", "-c"]
+
+ARG DEBIAN_FRONTEND=noninteractive
+
+# Drop the base image's Python 3.10 ttnn venv; tt-mlir/tt-xla need their own 3.12 venvs.
+ENV PATH=/opt/openmpi-v5.0.7-ulfm/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
+ENV VIRTUAL_ENV=
+ENV PYTHON_ENV_DIR=
+
+# The base image already ships clang-20, libc++-20, lld-20, ninja and CMake 4.x.
+# The rest mirrors tt-mlir's .github/Dockerfile.base and tt-xla's build-from-source docs.
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    software-properties-common \
+    build-essential \
+    git \
+    git-lfs \
+    ccache \
+    wget \
+    curl \
+    zstd \
+    unzip \
+    zip \
+    pkg-config \
+    patchelf \
+    file \
+    flex \
+    bison \
+    protobuf-compiler \
+    libprotobuf-dev \
+    libhwloc-dev \
+    libnuma-dev \
+    libtbb-dev \
+    libcapstone-dev \
+    libyaml-cpp-dev \
+    libgtest-dev \
+    libboost-all-dev \
+    libnsl-dev \
+    libssl-dev \
+    libffi-dev \
+    && add-apt-repository ppa:deadsnakes/ppa -y \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends python3.12 python3.12-dev python3.12-venv \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/bin/ld.lld-20 /usr/bin/ld.lld \
+    && ln -sf /usr/bin/lld-20 /usr/bin/lld \
+    && clang --version && clang++ --version && ld.lld --version && ninja --version && cmake --version \
+    && python3.12 --version
+
+# torch-xla is a Bazel build; bazelisk picks the Bazel version from the repo's .bazelversion.
+ARG BAZELISK_VERSION=v1.25.0
+RUN curl -fsSL "https://github.com/bazelbuild/bazelisk/releases/download/${BAZELISK_VERSION}/bazelisk-linux-arm64" \
+        -o /usr/local/bin/bazelisk \
+    && chmod +x /usr/local/bin/bazelisk \
+    && ln -sf /usr/local/bin/bazelisk /usr/local/bin/bazel
+
+ENV CC=clang
+ENV CXX=clang++
+ENV TTMLIR_TOOLCHAIN_DIR=/opt/ttmlir-toolchain
+ENV CCACHE_DIR=/ccache
+ENV CCACHE_MAXSIZE=20G
+# Portable tracy build (as in tt-xla's manylinux image).
+ENV TRACY_NO_INVARIANT_CHECK=1
+ENV TRACY_NO_ISA_EXTENSIONS=1
+
+RUN mkdir -p /src /wheels "${TTMLIR_TOOLCHAIN_DIR}" "${CCACHE_DIR}"
+WORKDIR /src
+
+#============================================================================
+# toolchain
+#============================================================================
+FROM builder AS toolchain
+
+# Pinned by tt-xla 3cfcfcfd (third_party/CMakeLists.txt), which pjrt-plugin-tt
+# 1.5.0.dev20260812001218 was built from.
+ARG TT_MLIR_VERSION=da6f1ce081af95630f5d679392e50a4bafa7c6ea
+
+RUN git clone https://github.com/tenstorrent/tt-mlir.git /src/tt-mlir \
+    && git -C /src/tt-mlir checkout "${TT_MLIR_VERSION}"
+
+# Builds flatbuffers + LLVM/MLIR (host target only, so AArch64) + fetches patched StableHLO and
+# Shardy, and creates the toolchain venv. The LLVM build tree is deleted afterwards to keep the
+# layer small; everything needed later is installed into TTMLIR_TOOLCHAIN_DIR.
+RUN cd /src/tt-mlir \
+    && cmake -G Ninja -B env/build env \
+    && cmake --build env/build \
+    && rm -rf env/build \
+    && "${TTMLIR_TOOLCHAIN_DIR}/bin/mlir-opt" --version \
+    && "${TTMLIR_TOOLCHAIN_DIR}/bin/flatc" --version \
+    && "${TTMLIR_TOOLCHAIN_DIR}/venv/bin/python" --version \
+    && file "${TTMLIR_TOOLCHAIN_DIR}/bin/mlir-opt"
+
+#============================================================================
+# pjrt-wheel
+#============================================================================
+FROM toolchain AS pjrt-wheel
+
+ARG TT_XLA_VERSION=3cfcfcfdefac5e310f9864c82548021636e18771
+# tt-metal commit pinned by tt-mlir da6f1ce0 (only used to look up the SFPI version).
+ARG TT_METAL_VERSION=5beed318d0f0d1c6212e605947fb0be80c9e0a1d
+# Match the x86 release this is a port of, so tt-media-server's pins line up.
+ARG TTXLA_WHEEL_VERSION=1.5.0.dev20260812001218
+# ninja parallelism for the tt-mlir / tt-metal builds (cmake --build honours this).
+ARG BUILD_JOBS=64
+ENV CMAKE_BUILD_PARALLEL_LEVEL=${BUILD_JOBS}
+
+# The wheel build uses TT_USE_SYSTEM_SFPI=ON, which requires exactly the SFPI version pinned by
+# tt-metal at /opt/tenstorrent/sfpi. The base image ships a different one (7.72.0), so replace it.
+RUN curl -fsSL "https://raw.githubusercontent.com/tenstorrent/tt-metal/${TT_METAL_VERSION}/tt_metal/sfpi-version" \
+        -o /tmp/sfpi-version \
+    && source /tmp/sfpi-version \
+    && deb="sfpi_${sfpi_version}_aarch64_debian.deb" \
+    && curl -fsSL "${sfpi_repo}/releases/download/${sfpi_version}/${deb}" -o "/tmp/${deb}" \
+    && echo "${sfpi_aarch64_debian_deb_hash}  /tmp/${deb}" | sha256sum -c - \
+    && rm -rf /opt/tenstorrent/sfpi \
+    && apt-get update \
+    && apt-get install -y --allow-downgrades "/tmp/${deb}" \
+    && rm -rf /var/lib/apt/lists/* "/tmp/${deb}" /tmp/sfpi-version \
+    && /opt/tenstorrent/sfpi/compiler/bin/riscv-tt-elf-g++ --version | head -1
+
+# {fmt} headers for patch_tt_xla.py's <format> replacement (used header-only). Same version as
+# tt-metal's CPM pin; Ubuntu 22.04's libfmt-dev (8.1.1) fails under clang 20's consteval rules.
+ARG FMT_VERSION=11.1.4
+RUN curl -fsSL "https://github.com/fmtlib/fmt/archive/refs/tags/${FMT_VERSION}.tar.gz" \
+        | tar -xz -C /tmp \
+    && cp -r "/tmp/fmt-${FMT_VERSION}/include/fmt" /usr/local/include/ \
+    && rm -rf "/tmp/fmt-${FMT_VERSION}"
+
+COPY patch_tt_xla.py /src/patch_tt_xla.py
+RUN git clone https://github.com/tenstorrent/tt-xla.git /src/tt-xla \
+    && git -C /src/tt-xla checkout "${TT_XLA_VERSION}" \
+    && python3.12 /src/patch_tt_xla.py /src/tt-xla
+
+# venv/activate only installs requirements when venv/ doesn't exist yet, so create it here with
+# just what the build needs. torch-xla and tt_lang have no aarch64 builds yet and aren't needed
+# to compile the plugin; the dev/test requirements (venv/requirements-dev.txt) are skipped too.
+RUN cd /src/tt-xla \
+    && python3.12 -m venv venv \
+    && venv/bin/pip install --no-cache-dir --upgrade pip \
+    && grep -v -E '^(torch-xla|tt_lang)==' python_package/requirements.txt > /tmp/requirements-build.txt \
+    && venv/bin/pip install --no-cache-dir -r /tmp/requirements-build.txt setuptools wheel
+
+# Same mode as upstream's release (manylinux) wheels: IN_CIBW_ENV=ON disables EmitPy execution
+# and drops bin/ + tt-metal/tests from the wheel. Builds tt-mlir (incl. tt-metal) from source.
+RUN --mount=type=cache,target=/ccache \
+    cd /src/tt-xla \
+    && source venv/activate \
+    && cd python_package \
+    && IN_CIBW_ENV=ON TTXLA_WHEEL_VERSION="${TTXLA_WHEEL_VERSION}" \
+       CXXFLAGS=-Wno-error=pass-failed CFLAGS=-Wno-error=pass-failed \
+       python setup.py bdist_wheel \
+    && cp dist/pjrt_plugin_tt-*.whl /wheels/ \
+    && ccache -s
+
+# vllm_tt is pure Python (tt-xla/integrations/vllm_plugin).
+RUN cd /src/tt-xla/integrations/vllm_plugin \
+    && /src/tt-xla/venv/bin/pip wheel --no-deps --no-build-isolation -w /wheels . \
+    && ls -la /wheels
+
+#============================================================================
+# torch-xla-wheel
+#============================================================================
+# Independent of the tt-mlir stages (FROM builder), so it can be built on its own.
+FROM builder AS torch-xla-wheel
+
+# Tenstorrent's pytorch-xla fork, as pinned by pjrt-plugin-tt (torch_xla-2.9.0+gited8a445).
+ARG TORCH_XLA_COMMIT=ed8a4459ffbfad683113a362bf20a01069333801
+# torch that pjrt-plugin-tt pins (torch==2.11.0+cpu) and whose source tag matches it.
+ARG TORCH_VERSION=2.11.0
+# XLA's heavier translation units need ~2 GB each with GCC; 48 fits in 125 GB RAM.
+ARG BAZEL_JOBS=48
+
+# Upstream (tt-xla scripts/build_torch_xla.sh) builds PyTorch from source and points the
+# fork's Bazel `@torch` repo (bazel/torch.BUILD, path "../") at that build tree. Instead we
+# build against the official aarch64 torch wheel, which is what runs next to torch-xla at
+# runtime anyway. The "PyTorch tree" is a shallow source checkout (for the ATen yaml/template
+# files codegen reads, and WORKSPACE) plus the wheel's torch/include and torch/lib (as
+# build/lib), plus the wheel itself in dist/ (OpenXLA's hermetic pip picks up
+# <workspace>/dist/*.whl as @pypi_torch, used to run torchgen).
+RUN python3.12 -m venv /src/torch-xla-venv \
+    # pybind11_bazel looks for python3-config next to the interpreter, then next to its symlink
+    # target (/usr/bin, where python3-config is the system 3.10 one); without this, _XLAC links
+    # libpython3.10.
+    && ln -s /usr/bin/python3.12-config /src/torch-xla-venv/bin/python3-config \
+    && /src/torch-xla-venv/bin/pip install --no-cache-dir --upgrade pip \
+    && git clone --depth 1 --branch "v${TORCH_VERSION}" https://github.com/pytorch/pytorch.git /src/pytorch \
+    && /src/torch-xla-venv/bin/pip download --no-deps --only-binary=:all: -d /src/pytorch/dist \
+        --index-url https://download.pytorch.org/whl/cpu "torch==${TORCH_VERSION}+cpu" \
+    && /src/torch-xla-venv/bin/pip install --no-cache-dir /src/pytorch/dist/torch-*.whl \
+        --extra-index-url https://download.pytorch.org/whl/cpu \
+    && /src/torch-xla-venv/bin/pip install --no-cache-dir \
+        numpy pyyaml setuptools wheel requests six typing_extensions absl-py \
+    && TORCH_PKG="$(/src/torch-xla-venv/bin/python -c 'import torch, os; print(os.path.dirname(torch.__file__))')" \
+    && cp -r "${TORCH_PKG}/include" /src/pytorch/torch/include \
+    && mkdir -p /src/pytorch/build \
+    && cp -r "${TORCH_PKG}/lib" /src/pytorch/build/lib \
+    && ls /src/pytorch/build/lib/libtorch.so /src/pytorch/build/lib/libtorch_cpu.so \
+          /src/pytorch/build/lib/libtorch_python.so /src/pytorch/build/lib/libc10.so \
+    && /src/torch-xla-venv/bin/python -c 'import torch; print(torch.__version__, torch._C._GLIBCXX_USE_CXX11_ABI)'
+
+RUN git clone https://github.com/tenstorrent/pytorch-xla.git /src/pytorch/xla \
+    && git -C /src/pytorch/xla checkout "${TORCH_XLA_COMMIT}"
+
+# .bazelversion pins Bazel 7.4.1 (bazelisk downloads the arm64 build). PYTHON_BIN_PATH,
+# PYTHON_CONFIG_BIN_PATH and HERMETIC_PYTHON_VERSION make pybind11_bazel and OpenXLA's hermetic
+# Python use 3.12 rather than the system 3.10 (tt-xla docs: "_XLAC ... compiled for Python
+# 3.10"). setup.py reads the C++ ABI flag from the installed torch. The Bazel cache is a
+# BuildKit cache mount; its id is versioned because pybind11_bazel doesn't refetch
+# @local_config_python when PYTHON_CONFIG_BIN_PATH changes.
+RUN --mount=type=cache,id=torch-xla-bazel-py312,target=/root/.cache/bazel \
+    cd /src/pytorch/xla \
+    && export PATH="/src/torch-xla-venv/bin:${PATH}" \
+    && export PYTHON_BIN_PATH=/src/torch-xla-venv/bin/python \
+    && export PYTHON_CONFIG_BIN_PATH=/usr/bin/python3.12-config \
+    && export HERMETIC_PYTHON_VERSION=3.12 \
+    && export TORCH_XLA_VERSION=2.9.0 GIT_VERSIONED_XLA_BUILD=1 BAZEL_JOBS="${BAZEL_JOBS}" \
+    && python setup.py bdist_wheel \
+    && bazel shutdown \
+    && objdump -p build/lib.*/_XLAC.cpython-312-*.so | grep NEEDED \
+    && objdump -p build/lib.*/_XLAC.cpython-312-*.so | grep -q 'NEEDED *libpython3.12.so' \
+    && ! objdump -p build/lib.*/_XLAC.cpython-312-*.so | grep -q 'libpython3.10' \
+    && cp dist/torch_xla-*.whl /wheels/ \
+    && ls -la /wheels
+
+#============================================================================
+# wheels
+#============================================================================
+FROM scratch AS wheels
+COPY --from=pjrt-wheel /wheels/ /
+COPY --from=torch-xla-wheel /wheels/ /
