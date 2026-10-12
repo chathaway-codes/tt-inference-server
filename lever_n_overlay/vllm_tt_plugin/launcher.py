@@ -1,0 +1,528 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
+
+import argparse
+import fnmatch
+import os
+import shlex
+import socket
+import subprocess
+import sys
+import weakref
+from dataclasses import dataclass, field
+
+import cloudpickle
+import yaml
+from vllm.config import ParallelConfig, VllmConfig
+from vllm.utils.import_utils import resolve_obj_by_qualname
+from vllm.utils.network_utils import get_ip
+from vllm.utils.system_utils import kill_process_tree
+from vllm.v1.engine.utils import CoreEngine
+from vllm.v1.executor.abstract import UniProcExecutor
+
+from vllm_tt_plugin.config import get_tt_config
+from vllm_tt_plugin.logger import init_tt_logger
+
+logger = init_tt_logger(__name__)
+_TT_VISIBLE_DEVICES_ENV = "TT_VISIBLE_DEVICES"
+
+try:
+    from vllm.v1.engine.utils import CoreEngineLauncher, EngineLaunchPlan
+except ImportError:
+    # Stock upstream vLLM (0.24 and 0.25.1 alike) launches engines directly
+    # from launch_core_engines() and has no public launcher extension classes.
+    # Keep the parsing and remote entrypoint portions of this plugin importable
+    # on such builds; if a later call tries to use the absent extension point,
+    # fail explicitly rather than at module import (which would also break
+    # every DP=1 host test).
+    @dataclass
+    class EngineLaunchPlan:  # type: ignore[no-redef]
+        remote_launched: bool = False
+        non_device_dp_ranks: set[int] = field(default_factory=set)
+
+    class CoreEngineLauncher:  # type: ignore[no-redef]
+        def get_engines_to_handshake(self, *_args, **_kwargs):
+            raise RuntimeError(
+                "this vLLM build does not expose the CoreEngineLauncher "
+                "extension point required by explicit tt-run/MPI launch"
+            )
+
+
+class TTLaunchPlan(EngineLaunchPlan):
+    rank_binding_file: str | None = None
+
+
+class TTCoreEngineLauncher(CoreEngineLauncher):
+    def prepare_launch(self, vllm_config: VllmConfig) -> EngineLaunchPlan:
+        rank_binding_file, non_device_dp_ranks = parse_tt_mpi_params(vllm_config)
+        if rank_binding_file is None:
+            return EngineLaunchPlan()
+
+        parallel_config = vllm_config.parallel_config
+        if (
+            parallel_config.data_parallel_master_ip
+            == ParallelConfig.data_parallel_master_ip
+        ):
+            host_ip = get_ip()
+            logger.info("Using host IP %s as TT data parallel address", host_ip)
+            parallel_config.data_parallel_master_ip = host_ip
+
+        vllm_config.parallel_config.data_parallel_size_local = len(non_device_dp_ranks)
+        plan = TTLaunchPlan(
+            remote_launched=True,
+            non_device_dp_ranks=non_device_dp_ranks,
+        )
+        plan.rank_binding_file = rank_binding_file
+        return plan
+
+    def get_engines_to_handshake(
+        self,
+        vllm_config: VllmConfig,
+        local_engine_count: int,
+        local_start_index: int | None,
+        dp_rank: int,
+        dp_size: int,
+        local_engines_only: bool,
+        offline_mode: bool,
+        plan: EngineLaunchPlan,
+    ) -> list[CoreEngine]:
+        if not plan.remote_launched:
+            return super().get_engines_to_handshake(
+                vllm_config,
+                local_engine_count,
+                local_start_index,
+                dp_rank,
+                dp_size,
+                local_engines_only,
+                offline_mode,
+                plan,
+            )
+        non_device_dp_ranks = plan.non_device_dp_ranks or set()
+        return [
+            CoreEngine(index=i, local=(i in non_device_dp_ranks))
+            for i in range(vllm_config.parallel_config.data_parallel_size)
+        ]
+
+    def launch_remote_engines(
+        self,
+        plan: EngineLaunchPlan,
+        handshake_address: str,
+        vllm_config: VllmConfig,
+        log_stats: bool,
+        cleanup_target: object,
+    ) -> None:
+        assert isinstance(plan, TTLaunchPlan)
+        assert plan.rank_binding_file is not None
+        # Launch must be done on the host with MPI rank 0 since we set that
+        # process's DP rank to 0, and torch distributed uses DP rank 0 to bind
+        # the TCP rendezvous endpoint.
+        assert vllm_config.parallel_config.data_parallel_rank == 0, (
+            "TT MPI must be launched from rank 0"
+        )
+        logger.info(
+            "TT-MPI mixed launch: dp_size=%d local_count=%d "
+            "non_device_ranks=%s handshake=%s",
+            vllm_config.parallel_config.data_parallel_size,
+            vllm_config.parallel_config.data_parallel_size_local,
+            plan.non_device_dp_ranks,
+            handshake_address,
+        )
+        tt_run_launch(
+            handshake_address=handshake_address,
+            vllm_config=vllm_config,
+            rank_binding_file=plan.rank_binding_file,
+            log_stats=log_stats,
+            cleanup_target=cleanup_target,
+        )
+
+
+def _validate_launch_from_rank0_host(mpi_args: str, host_ip: str) -> None:
+    if not mpi_args:
+        return
+    try:
+        argv = shlex.split(mpi_args)
+    except Exception:
+        argv = []
+    mapby_path = None
+    # Parse --map-by to locate rankfile and ensure rank 0 host matches host_ip.
+    for i, tok in enumerate(argv):
+        if tok.startswith("--map-by"):
+            if "=" in tok:
+                value = tok.split("=", 1)[1]
+            elif i + 1 < len(argv):
+                value = argv[i + 1]
+            else:
+                value = ""
+            if "file=" in value:
+                mapby_path = value.split("file=", 1)[1].split(",", 1)[0].strip()
+            if not mapby_path and value and os.path.isfile(value):
+                mapby_path = value
+            break
+    if not (mapby_path and os.path.isfile(mapby_path)):
+        return
+
+    # Open MPI rankfiles use entries like `rank 0=<host> ...`.
+    rank0_host = None
+    try:
+        with open(mapby_path) as f:
+            for line in f:
+                stripped = line.strip()
+                if not stripped or stripped.startswith("#"):
+                    continue
+                tokens = stripped.split()
+                if len(tokens) >= 2 and tokens[0] == "rank" and "=" in tokens[1]:
+                    left, right = tokens[1].split("=", 1)
+                    try:
+                        rank_num = int(left)
+                    except Exception:
+                        rank_num = -1
+                    if rank_num == 0:
+                        rank0_host = right.strip()
+                        break
+    except Exception:
+        rank0_host = None
+    if not rank0_host:
+        return
+
+    # Accept either direct IP rankfiles or hostnames that resolve to host_ip.
+    resolved_ips: set[str] = set()
+    if all(c.isdigit() or c == "." for c in rank0_host):
+        resolved_ips.add(rank0_host)
+    try:
+        info = socket.getaddrinfo(rank0_host, None, proto=socket.IPPROTO_TCP)
+        for ai in info:
+            resolved_ips.add(ai[4][0])
+    except Exception as e:
+        logger.warning(
+            "Failed to resolve IP address for rank 0 host %s: %s", rank0_host, e
+        )
+        if not resolved_ips:
+            return
+    assert host_ip in resolved_ips, (
+        f"MPI rank 0 host {rank0_host} from rankfile {mapby_path} "
+        f"(resolves to {sorted(resolved_ips)}) does not match "
+        f"launcher host IP {host_ip}."
+    )
+    logger.info("Validated launching from MPI rank 0 host %s", rank0_host)
+
+
+def _resolve_remote_dp_rank(vllm_config: VllmConfig, mpi_world: int) -> None:
+    pc = vllm_config.parallel_config
+    if pc.data_parallel_size != mpi_world:
+        raise RuntimeError(
+            "Standard DP mode requires one TT MPI rank per DP rank: "
+            f"data_parallel_size ({pc.data_parallel_size}) must equal "
+            f"MPI world size ({mpi_world})"
+        )
+
+
+def _requires_tt_mpi_rank_binding(vllm_config: VllmConfig) -> bool:
+    tt_config = get_tt_config(vllm_config)
+    parallel_config = vllm_config.parallel_config
+    return bool(
+        tt_config.get("mpi_args")
+        or getattr(parallel_config, "nnodes", 1) > 1
+        or getattr(parallel_config, "node_rank", 0) > 0
+    )
+
+
+def _parse_rank_binding_visible_devices(raw_value: object, rank: int) -> set[int]:
+    if not isinstance(raw_value, str):
+        raise RuntimeError(
+            f"rank_binding rank {rank} must set env_overrides."
+            f"{_TT_VISIBLE_DEVICES_ENV} to a non-empty string"
+        )
+
+    device_tokens = [token.strip() for token in raw_value.split(",") if token.strip()]
+    if not device_tokens:
+        raise RuntimeError(
+            f"rank_binding rank {rank} must set env_overrides."
+            f"{_TT_VISIBLE_DEVICES_ENV} to a non-empty device list"
+        )
+
+    device_ids: set[int] = set()
+    for token in device_tokens:
+        try:
+            device_id = int(token)
+        except ValueError as exc:
+            raise RuntimeError(
+                f"rank_binding rank {rank} contains non-integer "
+                f"{_TT_VISIBLE_DEVICES_ENV} entry {token!r}"
+            ) from exc
+        if device_id in device_ids:
+            raise RuntimeError(
+                f"rank_binding rank {rank} assigns duplicate "
+                f"{_TT_VISIBLE_DEVICES_ENV} device {device_id}"
+            )
+        device_ids.add(device_id)
+
+    return device_ids
+
+
+def _validate_rank_bindings(rank_bindings: object) -> int:
+    if not isinstance(rank_bindings, list):
+        raise RuntimeError("rank_binding field 'rank_bindings' must be a list")
+
+    if not rank_bindings:
+        raise RuntimeError("rank_binding must contain at least one MPI rank")
+
+    seen_ranks: set[int] = set()
+    device_owners: dict[int, int] = {}
+    for entry in rank_bindings:
+        if not isinstance(entry, dict):
+            raise RuntimeError("rank_binding entries must be mappings")
+
+        rank = entry.get("rank")
+        if not isinstance(rank, int):
+            raise RuntimeError("rank_binding entries must define an integer rank")
+        if rank in seen_ranks:
+            raise RuntimeError(f"rank_binding contains duplicate rank {rank}")
+        seen_ranks.add(rank)
+
+        env_overrides = entry.get("env_overrides")
+        if not isinstance(env_overrides, dict):
+            raise RuntimeError(
+                f"rank_binding rank {rank} must define env_overrides with "
+                f"{_TT_VISIBLE_DEVICES_ENV}"
+            )
+
+        device_ids = _parse_rank_binding_visible_devices(
+            env_overrides.get(_TT_VISIBLE_DEVICES_ENV),
+            rank,
+        )
+        overlapping_devices = sorted(
+            device_id for device_id in device_ids if device_id in device_owners
+        )
+        if overlapping_devices:
+            owners = ", ".join(
+                f"{device_id} (already owned by rank {device_owners[device_id]})"
+                for device_id in overlapping_devices
+            )
+            raise RuntimeError(
+                f"rank_binding rank {rank} overlaps {_TT_VISIBLE_DEVICES_ENV} "
+                f"assignments: {owners}"
+            )
+        for device_id in device_ids:
+            device_owners[device_id] = rank
+
+    expected_ranks = set(range(len(rank_bindings)))
+    if seen_ranks != expected_ranks:
+        raise RuntimeError(
+            "rank_binding ranks must form a contiguous 0..N-1 range; "
+            f"got {sorted(seen_ranks)}"
+        )
+
+    return len(rank_bindings)
+
+
+def parse_tt_mpi_params(vllm_config: VllmConfig) -> tuple[str | None, set[int]]:
+    parallel_config = vllm_config.parallel_config
+    assert parallel_config.data_parallel_backend != "ray", (
+        "TT does not support ray-based data parallel backend"
+    )
+    tt_config = get_tt_config(vllm_config)
+    rank_binding_file = tt_config.get("rank_binding")
+    if not rank_binding_file and _requires_tt_mpi_rank_binding(vllm_config):
+        raise RuntimeError(
+            "TT explicit MPI launch requires tt.rank_binding when mpi_args, "
+            "nnodes > 1, or node_rank > 0 are set"
+        )
+
+    non_device_dp_ranks: set[int] = set()
+    if rank_binding_file:
+        if not isinstance(rank_binding_file, str) or not rank_binding_file.strip():
+            raise RuntimeError(
+                "TT plugin config key 'rank_binding' must be a non-empty string"
+            )
+        try:
+            with open(rank_binding_file) as f:
+                rb = yaml.safe_load(f) or {}
+            rank_bindings = rb.get("rank_bindings", [])
+            mpi_world = _validate_rank_bindings(rank_bindings)
+        except Exception as e:
+            raise RuntimeError(
+                f"Failed to read rank binding '{rank_binding_file}': {e}"
+            ) from e
+
+        _resolve_remote_dp_rank(vllm_config, mpi_world)
+        non_device_dp_ranks = set()
+    return rank_binding_file, non_device_dp_ranks
+
+
+def tt_run_launch(
+    handshake_address: str,
+    vllm_config: VllmConfig,
+    rank_binding_file: str,
+    log_stats: bool,
+    cleanup_target: object,
+) -> None:
+    if not rank_binding_file:
+        raise RuntimeError("rank_binding_file must be a non-empty string")
+
+    tt_config = get_tt_config(vllm_config)
+    mpi_args = tt_config.get("mpi_args", "")
+    extra_ttrun_args = tt_config.get("extra_ttrun_args")
+    cfg_dir = tt_config.get("config_pkl_dir")
+
+    if not cfg_dir:
+        raise RuntimeError(
+            "TT plugin config key 'config_pkl_dir' is required for TT MPI launch"
+        )
+    if not os.path.isdir(cfg_dir):
+        raise RuntimeError("TT plugin config key 'config_pkl_dir' must be a directory")
+
+    host_ip = get_ip()
+    parallel_config = vllm_config.parallel_config
+    assert parallel_config.data_parallel_master_ip == host_ip, (
+        f"data_parallel_master_ip {parallel_config.data_parallel_master_ip} "
+        f"must be the same as launcher host IP {host_ip}"
+    )
+    _validate_launch_from_rank0_host(mpi_args, host_ip)
+
+    # Remote ranks read the pickled config from a shared directory.
+    serialized_config_path = os.path.join(cfg_dir, "tmp_vllm_tt_cfg.pkl")
+    with open(serialized_config_path, "wb") as tf:
+        cloudpickle.dump(vllm_config, tf)
+
+    # Create a temporary rank binding so vLLM-specific env vars can be injected
+    # without mutating the user's source rank-binding file.
+    with open(rank_binding_file) as f:
+        rb = yaml.safe_load(f)
+    rb.setdefault("global_env", {})
+    default_env_patterns = ["VLLM_*", "MESH_DEVICE"]
+    env_passthrough = tt_config.get("env_passthrough", default_env_patterns)
+    if isinstance(env_passthrough, (list, tuple)):
+        to_inject = {}
+        for key, val in os.environ.items():
+            for pattern in env_passthrough:
+                if fnmatch.fnmatch(key, pattern):
+                    to_inject[key] = val
+                    break
+        for key, val in to_inject.items():
+            rb["global_env"].setdefault(key, val)
+
+    tmp_rb_path = os.path.join(cfg_dir, "tmp_vllm_tt_rank_binding.yaml")
+    with open(tmp_rb_path, "w") as tf:
+        yaml.safe_dump(rb, tf)
+
+    normalized_extra_ttrun_args: list[str] = []
+    if extra_ttrun_args:
+        if not isinstance(extra_ttrun_args, str):
+            raise RuntimeError(
+                "TT plugin config key 'extra_ttrun_args' must be a string"
+            )
+        normalized_extra_ttrun_args = shlex.split(extra_ttrun_args)
+        # These flags are owned by this launcher so it can control config
+        # staging and avoid conflicting rank-binding or MPI argument sources.
+        reserved_flags = {"--rank-binding", "--mpi-args"}
+        if any(
+            (tok in reserved_flags)
+            or any(tok.startswith(f"{flag}=") for flag in reserved_flags)
+            for tok in normalized_extra_ttrun_args
+        ):
+            raise RuntimeError(
+                "TT plugin config key 'extra_ttrun_args' must not include "
+                "--rank-binding or --mpi-args"
+            )
+
+    # tt-run launches one Python engine entrypoint per MPI rank.
+    cmd = ["tt-run"]
+    cmd.extend(normalized_extra_ttrun_args)
+    cmd.extend(["--rank-binding", tmp_rb_path])
+    if mpi_args:
+        cmd.extend(["--mpi-args", mpi_args])
+    cmd.extend(
+        [
+            sys.executable,
+            "-m",
+            "vllm_tt_plugin.launcher",
+            "--handshake",
+            str(handshake_address),
+            "--config-pkl",
+            str(serialized_config_path),
+            "--log-stats",
+            ("1" if log_stats else "0"),
+        ]
+    )
+
+    logger.info("Launching engines with tt-run: %s", shlex.join(cmd))
+    mpi_proc = subprocess.Popen(cmd, env=os.environ.copy())
+    _setup_mpi_proc_finalizer(mpi_proc, cleanup_target)
+
+
+def _setup_mpi_proc_finalizer(
+    mpi_proc: subprocess.Popen, cleanup_target: object
+) -> None:
+    def _finalize_mpi(proc_ref):
+        proc = proc_ref()
+        if proc is None or proc.poll() is not None:
+            return
+        proc.terminate()
+        try:
+            proc.wait(timeout=5.0)
+        except subprocess.TimeoutExpired:
+            logger.warning(
+                "tt-run subprocess did not exit within timeout, sending SIGKILL"
+            )
+            if proc.pid is not None:
+                kill_process_tree(proc.pid)
+
+    weakref.finalize(cleanup_target, _finalize_mpi, weakref.ref(mpi_proc))
+
+
+def _parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="TT engine core entrypoint")
+    parser.add_argument("--handshake", required=True, help="Handshake address")
+    parser.add_argument("--config-pkl", required=True, dest="config_pkl")
+    parser.add_argument("--log-stats", required=True, choices=["0", "1"])
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = _parse_args()
+    if not os.path.isfile(args.config_pkl):
+        raise RuntimeError(f"Config file is not a file: {args.config_pkl}")
+    if os.path.islink(args.config_pkl):
+        raise RuntimeError(f"Config file is a symlink: {args.config_pkl}")
+
+    with open(args.config_pkl, "rb") as f:
+        vllm_config: VllmConfig = cloudpickle.load(f)
+
+    has_mpi = "OMPI_COMM_WORLD_SIZE" in os.environ or "PMI_SIZE" in os.environ
+    mpi_rank = int(
+        os.environ.get("OMPI_COMM_WORLD_RANK", os.environ.get("PMI_RANK", "0"))
+    )
+    mpi_world = int(
+        os.environ.get("OMPI_COMM_WORLD_SIZE", os.environ.get("PMI_SIZE", "1"))
+    )
+    if not has_mpi:
+        raise RuntimeError("TT engine core must be launched under MPI")
+
+    pc = vllm_config.parallel_config
+    _resolve_remote_dp_rank(vllm_config, mpi_world)
+    pc.data_parallel_rank = mpi_rank
+    pc.data_parallel_rank_local = 0
+    assert pc.distributed_executor_backend == "uni", (
+        "TT MPI must be used with uniproc executor backend"
+    )
+
+    engine_core_proc_cls = resolve_obj_by_qualname(pc.engine_core_proc_cls)
+    engine_core_proc_cls.run_engine_core(
+        vllm_config=vllm_config,
+        local_client=False,
+        handshake_address=args.handshake,
+        executor_class=UniProcExecutor,
+        log_stats=args.log_stats == "1",
+        dp_rank=pc.data_parallel_rank,
+        local_dp_rank=pc.data_parallel_rank_local,
+    )
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except SystemExit:
+        raise
+    except Exception:
+        logger.exception("TT engine core failed")
+        sys.exit(1)

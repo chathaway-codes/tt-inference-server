@@ -1,0 +1,1121 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: 2025 Tenstorrent USA, Inc.
+
+import os
+from enum import Enum
+from typing import TYPE_CHECKING, cast
+
+from vllm.v1.core.sched.async_scheduler import AsyncScheduler
+from vllm.v1.core.sched.interface import PauseState
+from vllm.v1.core.sched.output import SchedulerOutput
+from vllm.v1.core.sched.request_queue import (
+    RequestQueue,
+    SchedulingPolicy,
+    create_request_queue,
+)
+from vllm.v1.core.sched.scheduler import Scheduler
+from vllm.v1.request import Request, RequestStatus
+
+from vllm_tt_plugin.config import (
+    get_tt_adaptive_block_max_prompt_tokens,
+    get_tt_block_output_kv_lookahead_tokens,
+    get_tt_output_tokens_per_step,
+    is_tt_adaptive_block_batched,
+    is_tt_adaptive_block_output_model,
+    is_tt_adaptive_block_ragged,
+    is_tt_block_output_model,
+)
+from vllm_tt_plugin.logger import init_tt_logger
+
+if TYPE_CHECKING:
+    from vllm.distributed.kv_transfer.kv_connector.v1 import KVConnectorBase_V1
+    from vllm.distributed.kv_transfer.kv_connector.v1.base import (
+        KVConnectorMetadata,
+    )
+
+logger = init_tt_logger(__name__)
+
+
+def _assert_no_dropped_side_effects_enabled() -> bool:
+    """Debug assertion for the default-mode fallback (PHASE2_DESIGN 6.3 (2)):
+    the discarded prefill-only output must carry no drained side effect the
+    id-merge below does not forward. On in tests, off in production."""
+    return os.environ.get("TT_SCHED_ASSERT_NO_DROPPED_SIDE_EFFECTS", "0") == "1"
+
+
+# ``SchedulerOutput`` has no backend metadata field. Like lane step state, this
+# TT-only signal is attached to the mutable output object and therefore follows
+# it through the executor serialization boundary. Counts, rather than a set of
+# request IDs, identify exactly how many newest in-flight frames a wholesale
+# prefix-cache reset made stale.
+_TT_FORCED_RESET_DISCARD_COUNTS_ATTR = "_tt_forced_reset_discard_counts"
+
+
+def set_tt_forced_reset_discard_counts(
+    scheduler_output: SchedulerOutput, counts: dict[str, int]
+) -> None:
+    if counts:
+        setattr(scheduler_output, _TT_FORCED_RESET_DISCARD_COUNTS_ATTR, dict(counts))
+
+
+def get_tt_forced_reset_discard_counts(
+    scheduler_output: SchedulerOutput,
+) -> dict[str, int]:
+    return dict(getattr(scheduler_output, _TT_FORCED_RESET_DISCARD_COUNTS_ATTR, {}))
+
+
+class TTSchedulingMode(Enum):
+    DEFAULT = "default"
+    DECODE_ONLY = "decode_only"
+    PREFILL_ONLY = "prefill_only"
+
+    @classmethod
+    def from_prefill_intent(cls, prefill_intent: int) -> "TTSchedulingMode":
+        if prefill_intent == 0:
+            return cls.DECODE_ONLY
+        if prefill_intent == 1:
+            return cls.PREFILL_ONLY
+        raise ValueError(f"Invalid TT scheduling intent: {prefill_intent}")
+
+
+class TTScheduler(AsyncScheduler):
+    """Scheduler for the TT (Tenstorrent) platform.
+
+    TT constraints:
+    - No mixed prefill+decode batches: each batch is either all-prefill
+      or all-decode.
+    - Token-chunked prefill is allowed: a long prefill may be split across
+      steps. After a partial chunk the base scheduler keeps the request in
+      ``running`` with ``is_prefill_chunk=True``; later prefill steps schedule
+      the next chunk until the prompt is fully computed. Those continuations
+      count as prefill work here, never as decodes.
+
+    The base scheduler holds temporarily blocked prefill requests (e.g. while
+    a structured-output grammar compiles) in ``skipped_waiting`` rather than
+    ``waiting``. Its prefill loop revisits that queue and promotes requests
+    whose dependency is ready. Decode-only scheduling must hide both queues so
+    that the base scheduler cannot admit a prefill into a decode step.
+
+    Inherits from AsyncScheduler to get num_output_placeholders support.
+    TT uses this scheduler in both sync and async execution modes:
+    - with async_scheduling=False, it behaves as the single TT scheduler
+      without execution overlap
+    - with async_scheduling=True, placeholders allow decode requests to be
+      re-scheduled before update_from_output processes the previous step's
+      results, enabling host/device overlap
+    - under async scheduling a preempted request keeps the tokens it had
+      already scheduled but not yet received, and needs no TT-side handling
+      for them. Those tokens are valid: the forward that produced them ran to
+      completion before the preempt freed any block, device submits form a
+      strict queue, and every async op is forced to complete before the next
+      prefill, so no later write can reach the KV they were computed against.
+      The base class appends them on arrival and the resumed prefill replays
+      them. ``Request.async_tokens_to_discard`` serves the wholesale
+      ``reset_prefix_cache`` teardown only; wiring ordinary preemption into it
+      drops valid tokens and silently truncates the response.
+      A preempted request with an outstanding output placeholder stays in the
+      waiting queue until that valid frame is accounted for. Resuming earlier
+      would replay and sample against the old token history, producing a second
+      physical frame for the same single placeholder and advancing seeded RNG
+      state for a token that must be discarded.
+
+    Supports ``set_forced_mode`` for lane coordination:
+    - ``TTSchedulingMode.DECODE_ONLY`` forces decode-only (even if waiting
+      queue is non-empty).
+    - ``TTSchedulingMode.PREFILL_ONLY`` forces prefill-only (and may return an
+      empty batch when there is no pending prefill work).
+    - ``TTSchedulingMode.DEFAULT`` uses the default policy: prefer prefill
+      when pending prefill work exists, but fall back to decode-only if
+      prefill cannot make progress and running decode requests exist.
+    """
+
+    waiting: RequestQueue
+    running: list[Request]
+    max_num_running_reqs: int
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._forced_mode = TTSchedulingMode.DEFAULT
+        self._pending_forced_reset_discard_counts: dict[str, int] = {}
+        self._output_tokens_per_step = get_tt_output_tokens_per_step(self.vllm_config)
+        self._is_block_output_model = is_tt_block_output_model(self.vllm_config)
+        # Adaptive: emit the block only on a solo decode step; batch >1 decodes
+        # as plain baseline. Lets max_num_seqs>1 coexist with block-output.
+        self._is_adaptive_block = is_tt_adaptive_block_output_model(self.vllm_config)
+        # Batched adaptive: the model runs one multi-user speculative step for
+        # every decoding request, so a decode step is a block step for ALL of
+        # them (not only when solo). Prefill anchors stay width-1.
+        self._adaptive_block_batched = is_tt_adaptive_block_batched(self.vllm_config)
+        # Ragged batched: a block step commits 1..W tokens per request (the
+        # model delivers tokens as produced instead of holding a stopped slot
+        # for a full block). The reservation stays W per step; only the width
+        # check relaxes. See _update_request_with_output.
+        self._adaptive_block_ragged = is_tt_adaptive_block_ragged(self.vllm_config)
+        if self._adaptive_block_ragged and not (
+            self._is_adaptive_block and self._adaptive_block_batched
+        ):
+            raise ValueError(
+                "tt_adaptive_block_ragged requires tt_adaptive_block_batched"
+            )
+        # Prompt-length frontier for the block path (0 = none): a longer prompt
+        # is served as plain baseline by the model for its whole lifetime, so
+        # its steps reserve width-1 even when solo.
+        self._adaptive_block_max_prompt = get_tt_adaptive_block_max_prompt_tokens(
+            self.vllm_config
+        )
+        # KV lookahead for block steps (model-declared): the block-output model
+        # writes the whole block -- and a speculative verify its rejected-draft
+        # tail -- into the paged KV within the step, so allocate_slots must
+        # cover that reach up front instead of one step later (a late slot is
+        # a write into the zero-padded page-table entry = the null block, and
+        # the token's KV is lost). Applied to every request for simplicity: at
+        # most one extra block per request is held early.
+        block_kv_lookahead = get_tt_block_output_kv_lookahead_tokens(self.vllm_config)
+        if self._is_block_output_model and block_kv_lookahead > 0:
+            self.num_lookahead_tokens = max(
+                self.num_lookahead_tokens, block_kv_lookahead
+            )
+        if self._is_block_output_model:
+            assert self.num_sampled_tokens_per_step == 1, (
+                "Block-output accounting requires upstream to reserve exactly "
+                "one sampled-token placeholder"
+            )
+            assert not self.kv_cache_manager.enable_caching, (
+                "Block-output models bypass the kv_cache_manager.cache_blocks "
+                "call made by AsyncScheduler._update_request_with_output and "
+                "must disable prefix caching"
+            )
+
+    def set_forced_mode(self, mode: TTSchedulingMode) -> None:
+        self._forced_mode = mode
+
+    # Host-only sampling controls and their neutral values: any of these
+    # forces the step onto host sampling (check_perform_device_sampling),
+    # which cannot construct a multi-token canvas and kills the engine.
+    # Penalties do not force host sampling, but a non-neutral value flips
+    # InputBatch.no_penalties and makes every block decode step build (and
+    # discard) penalty token tensors that grow with the committed session
+    # length; the frontend neutralizes them, so mirror that here for
+    # prebuilt requests that bypassed it.
+    _BLOCK_HOST_ONLY_SAMPLING_NEUTRAL = (
+        ("min_p", 0.0),
+        ("min_tokens", 0),
+        ("logit_bias", None),
+        ("allowed_token_ids", None),
+        ("bad_words", None),
+        ("_bad_words_token_ids", None),
+        ("presence_penalty", 0.0),
+        ("frequency_penalty", 0.0),
+        ("repetition_penalty", 1.0),
+    )
+
+    def add_request(self, request: Request) -> None:
+        if self._is_block_output_model:
+            existing = self.requests.get(request.request_id)
+            if existing is not None and existing.streaming_queue is None:
+                # A continuation (next input chunk or the closing sentinel) of
+                # a session whose resumable flag the neutralization below
+                # scrubbed. The base scheduler asserts on the missing
+                # streaming_queue, which would tear down EngineCore. The
+                # session cannot accept more input, so drop the message; the
+                # live request finishes and notifies its client on its own.
+                logger.warning(
+                    "Dropping streaming-input continuation for request %s: "
+                    "block-output models do not support resumable sessions",
+                    request.request_id,
+                )
+                return
+            self._truncate_unservable_block_prompt(request)
+            self._align_block_output_max_tokens(request)
+            self._neutralize_block_output_host_sampling(request)
+        super().add_request(request)
+
+    def _truncate_unservable_block_prompt(self, request: Request) -> None:
+        """Contain a bypassed prompt that leaves no room for a whole canvas.
+
+        Frontend validation rejects such prompts; a prebuilt EngineCoreRequest
+        skips it, and neither upstream EngineCore.add_request nor the base
+        scheduler re-checks prompt length. Admitted untouched, the prompt
+        either can never be scheduled (chunked prefill is disabled and the
+        prompt exceeds the token budget: parked in WAITING forever,
+        head-of-line blocking every later request), overflows the worker's
+        max_model_len-wide token buffer, or — even when it fits
+        max_model_len — trips the adapter's own canvas-capacity validation,
+        which raises out of execute_model in eager (no-upfront-capture) mode
+        where there is no graceful stop-canvas rejection. Truncate to the
+        largest tile-aligned prompt that still fits one whole canvas below
+        the tile-floored max_model_len, so every admitted request is
+        genuinely servable and finishes through the normal notifying path.
+        Prefix caching is disabled for block models (__init__ asserts it), so
+        the request's stale block hashes stay inert.
+        """
+        from vllm_tt_plugin.platform import _TT_TOKEN_TILE_SIZE
+
+        if request.mm_features:
+            # A text-only block model has a zero encoder budget: a feature at
+            # offset 0 forces zero-token schedules forever (head-of-line
+            # stall), and an interior offset carves a partial prefill chunk
+            # that flips the step onto host sampling and kills the engine.
+            # Dropped, the placeholder positions decode as ordinary tokens.
+            logger.warning(
+                "Request %s bypassed frontend validation with multimodal "
+                "features a block-output model cannot encode; dropping them",
+                request.request_id,
+            )
+            request.mm_features = []
+        if request.prompt_token_ids is None and request.num_prompt_tokens > 0:
+            # The frontend rejects prompt_embeds for every TT model; admitted
+            # bare, the worker's request-state builder raises
+            # NotImplementedError out of execute_model. Replace with
+            # placeholder tokens; an embeds-only Request already carries
+            # [0] * num_prompt_tokens in _all_token_ids, so the replacement
+            # keeps every derived view consistent.
+            logger.warning(
+                "Request %s bypassed frontend validation with a "
+                "prompt_embeds-only prompt the TT backend does not support; "
+                "replacing with %d placeholder tokens",
+                request.request_id,
+                request.num_prompt_tokens,
+            )
+            request.prompt_token_ids = [0] * request.num_prompt_tokens
+            request.prompt_embeds = None
+        if request.prompt_embeds is not None:
+            # Mixed-mode prompts (token ids + embeds + prompt_is_token_ids
+            # mask) carry placeholder ids at the embed positions, so the TT
+            # model decodes them as ordinary tokens either way; scrub the
+            # embeds so the prompt_len x hidden_size tensor is not pinned for
+            # the request lifetime, and warn like the embeds-only branch.
+            logger.warning(
+                "Request %s bypassed frontend validation with mixed "
+                "token/embeds prompt content the TT backend does not "
+                "support; dropping the embeds (placeholder ids decode as "
+                "ordinary tokens)",
+                request.request_id,
+            )
+            request.prompt_embeds = None
+            request.prompt_is_token_ids = None
+        if request.num_prompt_tokens == 0:
+            # The frontend rejects empty prompts; admitted bare, the waiting
+            # loop schedules zero new tokens and upstream's num_new_tokens
+            # assert tears down the engine. Pad to one placeholder token so
+            # the request schedules and finishes through the normal path.
+            logger.warning(
+                "Request %s bypassed frontend validation with an empty "
+                "prompt; padding to one placeholder token",
+                request.request_id,
+            )
+            request.prompt_token_ids = [0]
+            request.prompt_embeds = None
+            request._all_token_ids.append(0)
+            request.num_prompt_tokens = 1
+            return
+        tile = _TT_TOKEN_TILE_SIZE
+        max_model_len = int(self.vllm_config.model_config.max_model_len)
+        aligned_max_model_len = max_model_len // tile * tile
+        keep = (aligned_max_model_len - self._output_tokens_per_step) // tile * tile
+        if request.num_prompt_tokens <= keep:
+            return
+        logger.warning(
+            "Request %s bypassed frontend validation with a %d-token prompt "
+            "that leaves no room for a whole %d-token canvas within "
+            "max_model_len; truncating to %d tokens so the request can "
+            "finish length-capped",
+            request.request_id,
+            request.num_prompt_tokens,
+            self._output_tokens_per_step,
+            keep,
+        )
+        if request.prompt_token_ids is not None:
+            request.prompt_token_ids = request.prompt_token_ids[:keep]
+        if getattr(request, "prompt_embeds", None) is not None:
+            request.prompt_embeds = request.prompt_embeds[:keep]
+        del request._all_token_ids[keep:]
+        request.num_prompt_tokens = keep
+
+    def _align_block_output_max_tokens(self, request: Request) -> None:
+        """Clamp max_tokens so a bypassed EngineCoreRequest cannot overshoot.
+
+        Frontend validation rejects an oversized limit. Prebuilt requests skip
+        that path; the last canvas would then be applied past max_model_len and
+        kill the engine. Shrink the logical cap to the largest whole-canvas
+        budget that still fits. Lane mode reaches this through each lane.
+        """
+        from vllm_tt_plugin.platform import _fit_block_output_max_tokens
+
+        prompt_ids = request.prompt_token_ids
+        if prompt_ids is None or request.sampling_params is None:
+            return
+        fitted = _fit_block_output_max_tokens(
+            len(prompt_ids),
+            request.max_tokens,
+            self._output_tokens_per_step,
+            int(self.vllm_config.model_config.max_model_len),
+        )
+        if fitted == request.max_tokens:
+            return
+        # The prompt truncation above guarantees at least one whole canvas
+        # fits, so a clamp always leaves a positive, servable budget.
+        logger.debug(
+            "Clamping block-output max_tokens from %s to %s for request %s "
+            "so physical canvases fit max_model_len",
+            request.max_tokens,
+            fitted,
+            request.request_id,
+        )
+        request.max_tokens = fitted
+        request.sampling_params.max_tokens = fitted
+
+    def _neutralize_block_output_host_sampling(self, request: Request) -> None:
+        """Strip controls a block-output model cannot honor from a bypassed
+        request: host-sampling forcers, structured outputs, and resumable
+        streaming-input sessions.
+
+        Frontend validation rejects these; a prebuilt EngineCoreRequest skips
+        it, and any of them flips the step to host sampling mid-flight (which
+        cannot construct a multi-token canvas) or parks the request forever.
+        Raising here is no safer: an add_request exception also tears down
+        EngineCore, so neutralize instead, the way the sampling controls are
+        neutralized at the frontend.
+        """
+        params = request.sampling_params
+        if params is None:
+            return
+        stripped = []
+        if request.structured_output_request is not None:
+            request.structured_output_request = None
+            stripped.append("structured_outputs")
+            # Request.__init__ parked the request on grammar compilation; with
+            # the structured-output request gone nothing would ever promote it
+            # out of skipped_waiting, so restore schedulability.
+            if request.status == RequestStatus.WAITING_FOR_STRUCTURED_OUTPUT_GRAMMAR:
+                request.status = RequestStatus.WAITING
+        if params.structured_outputs is not None:
+            params.structured_outputs = None
+        if request.resumable:
+            # A resumable session parks the stopped request to wait for more
+            # input instead of finishing it, permanently leaking the
+            # model-owned state slot. The frontend rejects it for block models.
+            request.resumable = False
+            stripped.append("resumable")
+        for field, neutral in self._BLOCK_HOST_ONLY_SAMPLING_NEUTRAL:
+            if getattr(params, field, neutral) not in (neutral, [], {}):
+                setattr(params, field, neutral)
+                stripped.append(field.lstrip("_"))
+        if stripped:
+            logger.warning(
+                "Request %s bypassed frontend validation; stripped "
+                "controls unsupported by block-output models: %s",
+                request.request_id,
+                ", ".join(stripped),
+            )
+
+    def _has_pending_prefill(self) -> bool:
+        """Whether any request still needs prefill work.
+
+        A request in ``skipped_waiting`` still needs a future prefill pass:
+        that is where the base scheduler retries promotion after its dependency
+        becomes ready. In decode-only mode this check also ensures both waiting
+        queues are hidden from the base scheduler.
+
+        A running ``is_prefill_chunk`` request is a partial prefill whose next
+        chunk can only be scheduled by a prefill step.
+        """
+        if self._pd_connector is None:
+            return (
+                bool(self.waiting)
+                or bool(getattr(self, "skipped_waiting", False))
+                or any(request.is_prefill_chunk for request in self.running)
+            )
+        # PD (PHASE2_DESIGN 6.3 (3)): remote-class requests (a fresh
+        # do_remote_prefill admission, a WAITING_FOR_REMOTE_KVS load, or a
+        # promoted-but-unadmitted continuation) are DECODE-pass work: their
+        # admission is a 0-token step and their first row is a 1-token decode
+        # at position T-1. Only plain local prefills count as prefill work.
+        return (
+            any(not self._is_remote_class(r) for r in self.waiting)
+            or any(
+                not self._is_remote_class(r)
+                for r in (getattr(self, "skipped_waiting", None) or ())
+            )
+            or any(request.is_prefill_chunk for request in self.running)
+        )
+
+    # ---- PD (prefill/decode disaggregation) helpers; inert without a connector
+
+    @property
+    def _pd_connector(self) -> "KVConnectorBase_V1 | None":
+        """The scheduler-role KV connector, or None (plain serving).
+
+        ``Scheduler.__init__`` creates it iff ``kv_transfer_config`` is set;
+        ``getattr`` keeps the host-only tests that build a bare scheduler with
+        ``__new__`` working.
+        """
+        return getattr(self, "connector", None)
+
+    @staticmethod
+    def _is_remote_class(request: Request) -> bool:
+        """Whether ``request`` belongs to the natural decode pass (6.3 (3)).
+
+        - WAITING_FOR_REMOTE_KVS: the load was admitted (blocks pinned, slot
+          claimed or about to be claimed by the worker).
+        - WAITING with ``num_computed_tokens > 0`` AND ``_tt_recv_recorded``
+          (set by ``update_state_after_alloc`` for every load that was issued;
+          it survives promotion): promoted by
+          ``_try_promote_blocked_waiting_request`` but not yet admitted for its
+          1-token continuation (``running == max_num_seqs`` or
+          ``allocate_slots(request, 1)`` failed). A FAILED load is always
+          fully invalidated (``num_computed_tokens`` -> 0) and prefix caching
+          is off on TT, so ``num_computed_tokens > 0`` alone would be exact
+          for loads -- but a resumable streaming-input session re-enters
+          WAITING with ``num_computed_tokens > 0`` too
+          (``Scheduler._update_request_as_session``) and its next chunk is
+          plain prefill work: without the flag it would be hidden from the
+          prefill-only pass and admitted next to running decodes (critic
+          NIT-1 / code-review MAJOR).
+        - WAITING, ``num_computed_tokens == 0`` and ``do_remote_prefill`` still
+          set (not demoted): a fresh async admission or a ``(None, False)``
+          deferral. A demoted request (``_tt_demoted``) is plain class.
+        """
+        status = getattr(request, "status", None)
+        if status == RequestStatus.WAITING_FOR_REMOTE_KVS:
+            return True
+        if status != RequestStatus.WAITING:
+            return False
+        params = getattr(request, "kv_transfer_params", None) or {}
+        if getattr(request, "num_computed_tokens", 0) > 0:
+            return bool(params.get("_tt_recv_recorded"))
+        return bool(params.get("do_remote_prefill")) and not params.get("_tt_demoted")
+
+    @staticmethod
+    def _holds_remote_slot(request: Request) -> bool:
+        """Whether a remote-class request holds (or is owed) a device state
+        slot on the worker although it is not in ``running`` (AM1).
+
+        WAITING_FOR_REMOTE_KVS entries claim a slot at the worker's step-begin
+        (``claim_remote_state_slot``); promoted WAITING entries with
+        ``num_computed_tokens == T-1`` keep it until their 1-token admission
+        moves them into ``running``. A ``(None, False)``-deferred request
+        (WAITING, ``num_computed_tokens == 0``) holds none, and neither does a
+        resumable streaming session re-entering WAITING (no
+        ``_tt_recv_recorded``; same guard as ``_is_remote_class``).
+        """
+        status = getattr(request, "status", None)
+        if status == RequestStatus.WAITING_FOR_REMOTE_KVS:
+            return True
+        if status != RequestStatus.WAITING:
+            return False
+        params = getattr(request, "kv_transfer_params", None) or {}
+        return getattr(request, "num_computed_tokens", 0) > 0 and bool(
+            params.get("_tt_recv_recorded")
+        )
+
+    def _has_remote_class_pending(self) -> bool:
+        return any(self._is_remote_class(r) for r in self.waiting) or any(
+            self._is_remote_class(r)
+            for r in (getattr(self, "skipped_waiting", None) or ())
+        )
+
+    def _take_requests(
+        self, queue: RequestQueue, requests: list[Request]
+    ) -> RequestQueue | None:
+        """MOVE ``requests`` out of ``queue`` into a temporary queue built with
+        ``prepend_request`` (the ``_take_preempted_requests_with_pending_outputs``
+        convention: ``prepend_requests`` of that temporary restores FCFS order).
+        Returns None when nothing was taken. A copy would duplicate every entry
+        once ``_schedule_decode_only``'s ``finally`` merges its swapped-in
+        queues back (G3)."""
+        if not requests:
+            return None
+        taken = create_request_queue(self.policy)
+        for request in requests:
+            taken.prepend_request(request)
+        queue.remove_requests(requests)
+        return taken
+
+    def _restore_requests_by_arrival(
+        self, saved: RequestQueue, leftover: RequestQueue
+    ) -> None:
+        """Put the entries of ``leftover`` (a queue in FCFS order, as the base
+        scheduler left it) back into ``saved`` IN PLACE without inverting the
+        FCFS order between plain and remote-class requests (critic NIT-7).
+
+        A plain ``prepend_requests`` would land every leftover remote-class
+        entry at the HEAD of ``saved``, ahead of older plain requests, so each
+        fallback pass would rotate the queue. Instead:
+
+        - PREEMPTED entries keep the base scheduler's convention and stay at
+          the head (``_preempt_request`` prepends them): ``leftover``'s (this
+          pass's, newest first) before ``saved``'s;
+        - every other entry is merged by ``Request.arrival_time`` (ties:
+          ``saved`` first), which is the FCFS key.
+
+        Under the priority policy the queue orders itself by (priority,
+        arrival) on every insertion, so a ``prepend_requests`` is exact there.
+        """
+        if not leftover:
+            return
+        if self.policy != SchedulingPolicy.FCFS:
+            saved.prepend_requests(leftover)
+            return
+        resumes = [r for r in leftover if r.status == RequestStatus.PREEMPTED] + [
+            r for r in saved if r.status == RequestStatus.PREEMPTED
+        ]
+        kept = [r for r in saved if r.status != RequestStatus.PREEMPTED]
+        added = [r for r in leftover if r.status != RequestStatus.PREEMPTED]
+        merged: list[Request] = list(resumes)
+        i = j = 0
+        while i < len(kept) and j < len(added):
+            if added[j].arrival_time < kept[i].arrival_time:
+                merged.append(added[j])
+                j += 1
+            else:
+                merged.append(kept[i])
+                i += 1
+        merged.extend(kept[i:])
+        merged.extend(added[j:])
+        # ``FCFSRequestQueue`` is a deque: rebuild ``saved`` in place so every
+        # reference to the queue object (``self.waiting``) stays valid.
+        saved.remove_requests(list(saved))
+        for request in merged:
+            saved.add_request(request)
+
+    def _take_preempted_requests_with_pending_outputs(self) -> RequestQueue | None:
+        """Temporarily remove resumes that still own an in-flight output.
+
+        Ordinary preemption preserves already-submitted frames. Waiting for the
+        corresponding placeholder to be consumed makes the accepted token part
+        of request history before resumed prefill is built, so replay samples
+        the next logical token and receives a fresh placeholder.
+
+        The temporary queue follows upstream's skipped-waiting convention:
+        ``prepend_request`` while collecting and ``prepend_requests`` while
+        restoring preserve FCFS order, while priority queues reorder by their
+        normal priority key.
+        """
+        deferred = [
+            request
+            for request in self.waiting
+            if request.status == RequestStatus.PREEMPTED
+            and request.num_output_placeholders > 0
+        ]
+        if not deferred:
+            return None
+
+        deferred_queue = create_request_queue(self.policy)
+        for request in deferred:
+            deferred_queue.prepend_request(request)
+        self.waiting.remove_requests(deferred)
+        return deferred_queue
+
+    def schedule(self, throttle_prefills: bool = False) -> SchedulerOutput:
+        deferred_resumes = self._take_preempted_requests_with_pending_outputs()
+        try:
+            return self._schedule_without_pending_output_resumes(throttle_prefills)
+        finally:
+            if deferred_resumes:
+                self.waiting.prepend_requests(deferred_resumes)
+
+    def _schedule_without_pending_output_resumes(
+        self, throttle_prefills: bool = False
+    ) -> SchedulerOutput:
+        # NOTE: `throttle_prefills` accepted for interface compatibility with the base
+        #        scheduler but unused - TT separates prefill/decode explicitly.
+        has_pending_prefill = self._has_pending_prefill()
+        # A partial prefill occupies ``running`` but cannot produce a decode
+        # token, so it must not make the decode fallback below look viable.
+        has_running_decode = any(
+            not request.is_prefill_chunk for request in self.running
+        )
+        mode = self._forced_mode
+
+        if mode == TTSchedulingMode.PREFILL_ONLY:
+            # Forced mode is shared by every lane. Return an empty prefill
+            # result unchanged so the coordinator can decide whether all lanes
+            # should fall back to decode together.
+            result = self._schedule_prefill_only()
+            return self._finalize_scheduler_output(result)
+        if mode == TTSchedulingMode.DECODE_ONLY:
+            if has_pending_prefill:
+                # Hide the waiting queues and partial prefills so the base
+                # scheduler cannot admit prefill work.
+                result = self._schedule_decode_only()
+                return self._finalize_scheduler_output(result)
+            # No pending prefill: base scheduler naturally runs decode-only.
+            result = super().schedule()
+            return self._finalize_scheduler_output(result)
+
+        # Default mode:
+        # Prefer prefill whenever prefill work is pending, so new requests are
+        # admitted and partial prefills advance.
+        if has_pending_prefill:
+            import os as _qwen_os
+            _qwen_on = _qwen_os.environ.get("TT_PREFILL_DECODE_INTERLEAVE", "0") == "1"
+            _qwen_partial = any(r.is_prefill_chunk for r in self.running)
+            _qwen_streak = getattr(self, "_qwen_prefill_streak", 0)
+            _qwen_credit = getattr(self, "_qwen_decode_credit", 0)
+            if _qwen_on and _qwen_partial and has_running_decode:
+                try:
+                    _qwen_r = int(_qwen_os.environ.get("TT_DECODE_STEPS_PER_PREFILL_CHUNK", "1"))
+                except ValueError:
+                    _qwen_r = 1
+                _qwen_yield = _qwen_streak >= 1 and _qwen_credit < _qwen_r
+                if _qwen_yield:
+                    self._qwen_decode_credit = _qwen_credit + 1
+                else:
+                    self._qwen_decode_credit = 0
+                    self._qwen_prefill_streak = _qwen_streak + 1
+                logger.info(
+                    f"[PINDIAG] m2 alternation: yield_decode={_qwen_yield} "
+                    f"streak={_qwen_streak} credit={_qwen_credit} r={_qwen_r}"
+                )
+                if _qwen_yield:
+                    result = self._schedule_decode_only()
+                    return self._finalize_scheduler_output(result)
+            else:
+                self._qwen_prefill_streak = 1
+                self._qwen_decode_credit = 0
+
+            prefill_result = self._schedule_prefill_only()
+            # If prefill cannot make progress (e.g. KV pressure), do not stall
+            # decode. Fall back to decode-only so running requests can advance
+            # and free capacity for a later prefill admission.
+            pd = self._pd_connector is not None
+            # PD (6.3, C3): remote-class requests never appear in a
+            # prefill-only pass, so with no running decode and a starved local
+            # prefill they would never see a pass that includes them, while
+            # holding the blocks the local prefill waits for. The remote-only
+            # decode pass promotes/admits them.
+            if prefill_result.total_num_scheduled_tokens == 0 and (
+                has_running_decode or (pd and self._has_remote_class_pending())
+            ):
+                result = self._schedule_decode_only()
+                # Unconditionally (PD or not): the discarded pass drained the
+                # scheduler's finished/preempted ids and freed mm hashes; the
+                # worker must see them or its per-request state leaks (R7).
+                self._merge_discarded_pass_side_effects(prefill_result, result)
+                return self._finalize_scheduler_output(result)
+            return self._finalize_scheduler_output(prefill_result)
+
+        # No pending prefill work in default mode: run decode-only naturally.
+        result = super().schedule()
+        return self._finalize_scheduler_output(result)
+
+    def _finalize_scheduler_output(
+        self, scheduler_output: SchedulerOutput
+    ) -> SchedulerOutput:
+        pending_reset_discards = getattr(
+            self, "_pending_forced_reset_discard_counts", {}
+        )
+        if pending_reset_discards:
+            set_tt_forced_reset_discard_counts(scheduler_output, pending_reset_discards)
+            self._pending_forced_reset_discard_counts = {}
+        connector = self._pd_connector
+        if connector is not None:
+            # PD (6.3 (1)): every TTScheduler path returns through here, so the
+            # connector's pending descriptors are drained into the ONE output
+            # the worker executes. ``_build_kv_connector_meta`` is a no-op for
+            # the base passes because default mode may run ``super().schedule()``
+            # twice per step and discard the first output.
+            scheduler_output.kv_connector_metadata = connector.build_connector_meta(
+                scheduler_output
+            )
+        return scheduler_output
+
+    def _build_kv_connector_meta(
+        self, connector: "KVConnectorBase_V1", scheduler_output: SchedulerOutput
+    ) -> "KVConnectorMetadata | None":
+        # Built in ``_finalize_scheduler_output`` instead (see there).
+        return None
+
+    @staticmethod
+    def _merge_discarded_pass_side_effects(
+        discarded: SchedulerOutput, result: SchedulerOutput
+    ) -> None:
+        """Forward the drained per-step state of a discarded base pass (6.3 (2)).
+
+        Every base ``schedule()`` snapshots and resets ``finished_req_ids`` /
+        ``reset_preempted_req_ids`` and drains the freed encoder mm hashes onto
+        its output. When default mode discards the empty prefill-only output
+        and returns the decode-only one, the worker would never see those ids:
+        ``_release_dead_state_slots`` would leak the slot claims and
+        ``runner.requests`` entries of every request that finished in that step.
+        This applies to plain serving as much as to PD (the fallback fires
+        whenever a starved local prefill meets a running decode), so the merge
+        is not gated on a connector.
+        """
+        result.finished_req_ids |= discarded.finished_req_ids
+        if discarded.preempted_req_ids:
+            result.preempted_req_ids = (result.preempted_req_ids or set()) | set(
+                discarded.preempted_req_ids
+            )
+        if discarded.free_encoder_mm_hashes:
+            result.free_encoder_mm_hashes = [
+                *discarded.free_encoder_mm_hashes,
+                *result.free_encoder_mm_hashes,
+            ]
+        if _assert_no_dropped_side_effects_enabled():
+            dropped = {
+                "kv_connector_metadata": discarded.kv_connector_metadata,
+                "kv_cache_block_copies": discarded.kv_cache_block_copies,
+                "new_block_ids_to_zero": discarded.new_block_ids_to_zero,
+                "scheduled_new_reqs": discarded.scheduled_new_reqs,
+                "num_scheduled_tokens": discarded.num_scheduled_tokens,
+            }
+            dropped = {k: v for k, v in dropped.items() if v}
+            if dropped:
+                raise RuntimeError(
+                    "TTScheduler discarded a prefill-only output that carries "
+                    f"side effects the fallback does not forward: {dropped}"
+                )
+
+    def _schedule_prefill_only(self) -> SchedulerOutput:
+        """Schedule prefill work: waiting requests and partial continuations.
+
+        Temporarily hides the running *decode* requests so the base scheduler's
+        running loop only advances partial prefills, and its waiting loop
+        admits new ones.  Adjusts max_num_running_reqs so the waiting loop
+        respects the true capacity with the decodes hidden.
+        """
+        pure_decodes = [r for r in self.running if not r.is_prefill_chunk]
+        partial_prefills = [r for r in self.running if r.is_prefill_chunk]
+
+        # PD (6.3 (3), AM1): hide the remote-class requests (they belong to the
+        # decode pass) and reserve their device state slots. A
+        # WAITING_FOR_REMOTE_KVS load and a promoted-but-unadmitted
+        # continuation are not in ``running`` yet hold a slot on the worker, so
+        # ``running + remote holders + admitted local prefills <= max_num_seqs``
+        # is what keeps the runner's ``_alloc_prefill_state_slots`` exhaustion
+        # ("no free device state slot") unreachable.
+        remote_holders = 0
+        taken_waiting: RequestQueue | None = None
+        taken_skipped: RequestQueue | None = None
+        skipped_waiting = getattr(self, "skipped_waiting", None)
+        if self._pd_connector is not None:
+            remote_waiting = [r for r in self.waiting if self._is_remote_class(r)]
+            remote_skipped = [
+                r for r in (skipped_waiting or ()) if self._is_remote_class(r)
+            ]
+            remote_holders = sum(
+                1 for r in remote_waiting + remote_skipped if self._holds_remote_slot(r)
+            )
+            taken_waiting = self._take_requests(self.waiting, remote_waiting)
+            if skipped_waiting is not None:
+                taken_skipped = self._take_requests(skipped_waiting, remote_skipped)
+
+        saved_max = self.max_num_running_reqs
+        self.running = cast(list[Request], partial_prefills)
+        interleave_on = os.environ.get("TT_PREFILL_DECODE_INTERLEAVE", "0") == "1"
+        if interleave_on:
+            if partial_prefills:
+                _qwen_allowed = len(partial_prefills)
+            else:
+                _qwen_allowed = 1
+            _qwen_hide = bool(partial_prefills)
+            self.max_num_running_reqs = max(
+                0, min(saved_max - len(pure_decodes) - remote_holders, _qwen_allowed)
+            )
+            _qwen_saved_waiting = self.waiting
+            _qwen_saved_skipped = getattr(self, "skipped_waiting", None)
+            if _qwen_hide:
+                self.waiting = create_request_queue(self.policy)
+                if _qwen_saved_skipped is not None:
+                    self.skipped_waiting = create_request_queue(self.policy)
+            logger.info(
+                f"[PINDIAG] m2 one-in-flight: partials={len(partial_prefills)} "
+                f"decodes={len(pure_decodes)} allowed={_qwen_allowed} "
+                f"hidden={_qwen_hide}"
+            )
+        else:
+            self.max_num_running_reqs = max(
+                0, saved_max - len(pure_decodes) - remote_holders
+            )
+        try:
+            result = super().schedule()
+        finally:
+            if interleave_on and _qwen_hide:
+                if self.waiting:
+                    _qwen_saved_waiting.prepend_requests(self.waiting)
+                if _qwen_saved_skipped is not None:
+                    if self.skipped_waiting:
+                        _qwen_saved_skipped.prepend_requests(self.skipped_waiting)
+                    self.skipped_waiting = _qwen_saved_skipped
+                self.waiting = _qwen_saved_waiting
+            self.running.extend(pure_decodes)
+            self.max_num_running_reqs = saved_max
+            # NIT-7: back by arrival time, not at the head (the pass may have
+            # left older plain requests waiting).
+            if taken_waiting is not None:
+                self._restore_requests_by_arrival(self.waiting, taken_waiting)
+            if taken_skipped is not None and skipped_waiting is not None:
+                self._restore_requests_by_arrival(skipped_waiting, taken_skipped)
+        return result
+
+    def _schedule_decode_only(self) -> SchedulerOutput:
+        """Schedule only running decode requests.
+
+        Temporarily hides both the ``waiting`` and ``skipped_waiting`` queues
+        so the base scheduler's waiting loop is a no-op and cannot promote a
+        grammar-ready structured-output request into this decode step, and
+        hides partial prefills so their next chunk is not scheduled into it
+        either.  Any requests that get preempted during decode scheduling are
+        merged back into the original queues afterwards.
+        """
+        partial_prefills = [r for r in self.running if r.is_prefill_chunk]
+
+        saved_waiting = self.waiting
+        saved_skipped = getattr(self, "skipped_waiting", None)
+        self.waiting = create_request_queue(self.policy)
+        if saved_skipped is not None:
+            self.skipped_waiting = create_request_queue(self.policy)
+        pd = self._pd_connector is not None
+        if pd:
+            # PD (6.3 (3)): the swapped-in queues contain ONLY the remote-class
+            # entries, MOVED out of the saved queues (a copy would be duplicated
+            # by the ``finally`` below). The base waiting loop then admits fresh
+            # remote loads (0 tokens, WAITING_FOR_REMOTE_KVS), promotes KV_DONE
+            # loads and schedules their 1-token continuation next to the
+            # running decodes: one decode batch for the runner (6.2). A request
+            # the connector demotes lands in ``skipped_waiting`` via
+            # ``(None, False)`` and is restored as plain class.
+            self._move_remote_class_into(saved_waiting, self.waiting)
+            if saved_skipped is not None:
+                self._move_remote_class_into(saved_skipped, self.skipped_waiting)
+        if partial_prefills:
+            self.running = [r for r in self.running if not r.is_prefill_chunk]
+        try:
+            result = super().schedule()
+        finally:
+            if pd:
+                self._restore_requests_by_arrival(saved_waiting, self.waiting)
+            elif self.waiting:
+                saved_waiting.prepend_requests(self.waiting)
+            if saved_skipped is not None:
+                if pd:
+                    self._restore_requests_by_arrival(
+                        saved_skipped, self.skipped_waiting
+                    )
+                elif self.skipped_waiting:
+                    saved_skipped.prepend_requests(self.skipped_waiting)
+                self.skipped_waiting = saved_skipped
+            self.waiting = saved_waiting
+            if partial_prefills:
+                self.running.extend(partial_prefills)
+        return result
+
+    def _move_remote_class_into(self, source: RequestQueue, target: RequestQueue):
+        """MOVE the remote-class entries of ``source`` into ``target`` in FCFS
+        order (``target`` is the queue the base scheduler will peek from)."""
+        remote = [r for r in source if self._is_remote_class(r)]
+        if not remote:
+            return
+        for request in remote:
+            target.add_request(request)
+        source.remove_requests(remote)
+
+    def reset_prefix_cache(
+        self, reset_running_requests: bool = False, reset_connector: bool = False
+    ) -> bool:
+        """Backstop against a stale-canvas resume vLLM's AR reset cannot represent.
+
+        The engine layer (``_install_block_output_reset_abort_patch``) aborts
+        running block requests and notifies their clients before delegating,
+        so a reset requested through ``EngineCoreProc`` succeeds. Live block
+        requests reach this guard only from engines that cannot notify the
+        owning clients (a bare in-process ``EngineCore``) or callers that
+        bypassed the engine layer; refusing here beats silently removing a
+        request someone is still waiting on.
+        """
+        if self._is_block_output_model and reset_running_requests and self.running:
+            message = (
+                "Cannot reset prefix cache while a block-output request is "
+                "running; finish or abort the request first."
+            )
+            # pause_generation(mode="keep") reaches this through an unguarded
+            # idle-state callback while intentionally retaining live requests.
+            # Returning False preserves them without letting an exception
+            # escape EngineCore and strand the callback's Future.
+            if self.pause_state == PauseState.PAUSED_ALL:
+                logger.error("%s", message)
+                return False
+            raise RuntimeError(message)
+        # AsyncScheduler turns every outstanding placeholder into one discard
+        # when it preempts all running requests. Preserve that scheduler-owned
+        # boundary for the runner: the stale frames must still be published so
+        # AsyncScheduler consumes its counters, but must not be appended to the
+        # runner's cached request state before resumed-prefill inputs are built.
+        reset_candidates = (
+            [
+                (request, request.num_output_placeholders)
+                for request in self.running
+                if request.num_output_placeholders > 0
+            ]
+            if reset_running_requests
+            else []
+        )
+        try:
+            return super().reset_prefix_cache(reset_running_requests, reset_connector)
+        finally:
+            for request, placeholder_count in reset_candidates:
+                if (
+                    request.status == RequestStatus.PREEMPTED
+                    and request.async_tokens_to_discard > 0
+                ):
+                    count = min(placeholder_count, request.async_tokens_to_discard)
+                    pending = self._pending_forced_reset_discard_counts
+                    pending[request.request_id] = (
+                        pending.get(request.request_id, 0) + count
+                    )
+
+    def _update_after_schedule(self, scheduler_output: SchedulerOutput) -> None:
+        """Reserve the complete physical output emitted by each block step.
+
+        The platform removes the upstream diffusion marker, so vLLM reserves
+        its normal one sampled-token placeholder. The TT adapter returns one
+        K-token canvas; reserve the remaining K-1 positions.
+        """
+        super()._update_after_schedule(scheduler_output)
+        if not self._is_block_output_model:
+            return
+        extra_placeholders = (
+            self._output_tokens_per_step - self.num_sampled_tokens_per_step
+        )
+        # Adaptive: the model emits its block ONLY on a SOLO DECODE step; every
+        # other step (batched decodes, and the prefill that host-samples the
+        # anchor) commits exactly one plain token and reserves one placeholder.
+        # This MUST match the model's own gate, which runs the spec block in
+        # decode_forward when batch == 1 and a plain token otherwise:
+        #   - solo == batch 1 (exactly one request scheduled this step);
+        #   - decode == the prompt is fully computed (a prefill step still has
+        #     num_computed_tokens < num_prompt_tokens, so it takes prefill_forward
+        #     and emits the single anchor). num_computed reflects prior committed
+        #     steps here, so it is 0<prompt on the prefill and >=prompt on the
+        #     first decode -- robust where an output-token count can still read 0.
+        # ``_tt_block_step`` records the decision so the reconciliation in
+        # _update_request_with_output takes the same path (block serving is
+        # synchronous, so the stamp and its commit never interleave).
+        solo = len(scheduler_output.num_scheduled_tokens) == 1
+
+        def _is_decode(req_id: str) -> bool:
+            # num_computed_tokens is already advanced by THIS step's scheduled
+            # tokens here, so subtract them back out: a step is a decode iff the
+            # prompt was fully computed BEFORE it. This is a pure scheduling-side
+            # quantity -- output-commit timing (which differs between sync tests
+            # and the pipelined engine loop) cannot skew it. A resumed replay
+            # scheduling prompt+output tokens lands back below the prompt
+            # boundary and correctly stays a non-block step.
+            request = self.requests[req_id]
+            scheduled = scheduler_output.num_scheduled_tokens[req_id]
+            return request.num_computed_tokens - scheduled >= request.num_prompt_tokens
+
+        # Batched adaptive: the model speculates for every decoding request of
+        # the step at once, so the whole step is either a decode step (every
+        # request blocks) or not. A step mixing prefill and decode requests
+        # cannot be described by one per-step width and is refused here rather
+        # than misaccounted; TTScheduler's default mode never builds one.
+        batched_block = False
+        if self._is_adaptive_block and self._adaptive_block_batched and not solo:
+            decodes = [
+                _is_decode(req_id)
+                for req_id in scheduler_output.num_scheduled_tokens
+                if not self.requests[req_id].is_prefill_chunk
+            ]
+            if decodes and any(decodes) and not all(decodes):
+                raise RuntimeError(
+                    "tt_adaptive_block_batched: a step mixes prefill and decode "
+                    f"requests ({sum(decodes)} decode of {len(decodes)}); the batched "
+                    "block contract needs decode-only steps"
+                )
+            batched_block = bool(decodes) and all(decodes)
+        for req_id in scheduler_output.num_scheduled_tokens:
+            request = self.requests[req_id]
+            if request.is_prefill_chunk:
+                continue
+            if self._is_adaptive_block:
+                is_decode = _is_decode(req_id)
+                spec_eligible = (
+                    self._adaptive_block_max_prompt == 0
+                    or request.num_prompt_tokens <= self._adaptive_block_max_prompt
+                )
+                block_step = (solo or batched_block) and is_decode and spec_eligible
+            else:
+                block_step = True
+            if block_step:
+                request.num_output_placeholders += extra_placeholders
+            request._tt_block_step = block_step
+
+    def _update_request_with_output(
+        self, request: Request, new_token_ids: list[int]
+    ) -> tuple[list[int], bool]:
+        """Commit one block and reconcile its full physical reservation."""
+        if not self._is_block_output_model:
+            return super()._update_request_with_output(request, new_token_ids)
+        # Adaptive: a request that decoded batched this step committed a single
+        # baseline token (no block was reserved for it) -> plain reconciliation.
+        # The flag is stamped by _ensure_block_output_placeholders in the SAME
+        # step this output belongs to (block-output serving is synchronous, so
+        # commits never interleave with the next step's scheduling decision).
+        if self._is_adaptive_block:
+            block_step = getattr(request, "_tt_block_step", None)
+            if block_step is None:
+                raise RuntimeError(
+                    "adaptive block-output request committed output without a "
+                    f"scheduling decision: req_id={request.request_id!r}"
+                )
+            if not block_step:
+                return super()._update_request_with_output(request, new_token_ids)
+        if request.async_tokens_to_discard:
+            raise RuntimeError(
+                "A stale async output reached synchronous block serving; "
+                "block-output async scheduling and running prefix resets are "
+                "unsupported"
+            )
+        width = len(new_token_ids)
+        if self._adaptive_block_ragged:
+            # Ragged block step: the runner already stripped the row's -1
+            # padding, so this is the request's own committed width n. Any n
+            # in 1..W is a valid block; a pad id reaching here means the
+            # runner did not strip (or the model padded mid-row).
+            if not 1 <= width <= self._output_tokens_per_step:
+                raise ValueError(
+                    "Model output width violates output_tokens_per_step "
+                    f"(ragged block): {width} not in 1..{self._output_tokens_per_step}"
+                )
+            if any(token_id < 0 for token_id in new_token_ids):
+                raise ValueError(
+                    "Ragged block output reached the scheduler with padding: "
+                    f"{new_token_ids}"
+                )
+        elif width != self._output_tokens_per_step:
+            raise ValueError(
+                "Model output width violates output_tokens_per_step: "
+                f"{width} != {self._output_tokens_per_step}"
+            )
+
+        # Scheduler appends token-by-token and trims at EOS, stop tokens,
+        # max_tokens, or max_model_len. The reservation is physical, so consume
+        # all K placeholders even when the client-visible block is trimmed.
+        # Calling Scheduler directly intentionally skips AsyncScheduler's
+        # cache_blocks hook. Platform validation disables prefix caching for
+        # block-output models, and __init__ asserts that invariant.
+        #
+        # Ragged blocks consume the SAME whole-W reservation even though only n
+        # tokens landed: the placeholder is the per-step reservation, and the
+        # request's computed tokens advance by n on their own. Upstream's
+        # running loop schedules ``num_tokens + placeholders - num_computed``
+        # next step; with placeholders back at 0 that is exactly n, so
+        # num_computed_tokens catches up to num_tokens and the next W-wide
+        # reservation is stamped on top. Subtracting only n would leave W-n
+        # placeholders behind, so the next step would schedule W tokens the
+        # request does not have and run num_computed_tokens past num_tokens;
+        # the runner's pre-step snapshot of it (num_computed_tokens_cpu, read
+        # by _is_still_prefilling and the decode input positions) would then
+        # point past the tokens the runner holds.
+        new_token_ids, stopped = Scheduler._update_request_with_output(
+            self, request, new_token_ids
+        )
+        request.num_output_placeholders -= self._output_tokens_per_step
+        if request.num_output_placeholders < 0:
+            raise RuntimeError(
+                "Output placeholders underflowed after block-output reconciliation"
+            )
+        return new_token_ids, stopped

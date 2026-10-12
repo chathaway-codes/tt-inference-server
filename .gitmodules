@@ -6,3 +6,6 @@
 [submodule "tt-media-server/cpp_server/third_party/Mooncake"]
 	path = tt-media-server/cpp_server/third_party/Mooncake
 	url = git@github.com:kvcache-ai/Mooncake.git
+[submodule "chathaway-tt-metal"]
+	path = chathaway-tt-metal
+	url = https://github.com/chathaway-codes/tt-metal.git
