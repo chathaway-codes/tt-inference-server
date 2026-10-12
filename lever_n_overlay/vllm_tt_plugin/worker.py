@@ -452,7 +452,34 @@ class TTWorker(WorkerBase):
                 kv_cache_config=kv_cache_config,
             )
             kv_transfer_state._KV_CONNECTOR_AGENT = connector
+        _qwen_prefix = os.environ.get("QWEN_PREFIX_REUSE") == "1"
+        if _qwen_prefix:
+            # Qwen prefix reuse (G1, qwen_prefix_runner_patch, design F7): the executor
+            # re-derives the block size after load_model; the model's 64-token page tables
+            # and 2048-token chunk arithmetic need exactly 64.
+            _qwen_prefix_sizes = sorted(
+                {group.kv_cache_spec.block_size for group in kv_cache_config.kv_cache_groups}
+            )
+            if self.cache_config.block_size != 64 or _qwen_prefix_sizes != [64]:
+                raise RuntimeError(
+                    "prefix reuse refused: cache_config.block_size=%s, KV spec block "
+                    "sizes %s; exactly 64 is required"
+                    % (self.cache_config.block_size, _qwen_prefix_sizes)
+                )
         self.model_runner.initialize_kv_cache(kv_cache_config)
+        if _qwen_prefix:
+            # The bring-up marker: the device KV dtype the model allocated (bfloat8_b under
+            # QWEN_SDPA_BF8=1; vLLM's own spec says bf16 either way).
+            _qwen_prefix_kv = getattr(self.model_runner, "kv_caches", None)
+            for _ in range(4):
+                if isinstance(_qwen_prefix_kv, (list, tuple)) and _qwen_prefix_kv:
+                    _qwen_prefix_kv = _qwen_prefix_kv[0]
+            logger.info(
+                "[PINDIAG] prefix: worker block_size=%d kv_groups=%d kv_dtype=%s",
+                self.cache_config.block_size,
+                len(kv_cache_config.kv_cache_groups),
+                getattr(_qwen_prefix_kv, "dtype", "?"),
+            )
         if connector is not None:
             self.model_runner.attach_kv_connector(connector)
 

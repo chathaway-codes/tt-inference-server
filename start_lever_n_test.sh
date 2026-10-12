@@ -6,7 +6,7 @@ CONTAINER_NAME="qwen-dflash-test"
 # Remove existing test container if present
 docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
 
-echo "Starting test container $CONTAINER_NAME..."
+echo "Starting test container $CONTAINER_NAME with Lever N enabled..."
 
 docker run -d \
   --name "$CONTAINER_NAME" \

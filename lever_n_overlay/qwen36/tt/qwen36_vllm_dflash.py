@@ -417,7 +417,7 @@ class Qwen36DFlashForCausalLM(Qwen36ForCausalLM):
             return pt[:, :nb].contiguous()
         return torch.cat([pt, torch.zeros(1, nb - pt.shape[1], dtype=torch.int32)], dim=1)
 
-    def _spec_prefill(self, model, dec, phys, prompt, T, pt_row, start=0):
+    def _spec_prefill(self, model, dec, phys, prompt, T, pt_row, start=0, req_id=None):
         """Eager tap-capturing prefill of ONE request into physical slot ``phys`` (masked bucket for a
         short prompt, 2048-token chunks + masked tail for a long one), each chunk's taps ingested into the
         drafter's ring for that slot. Returns host logits [1, vocab] (float)."""
@@ -432,7 +432,9 @@ class Qwen36DFlashForCausalLM(Qwen36ForCausalLM):
             dec.ctx_len[phys] = 0
         model._dflash_tap = True
         try:
-            logits_dev = model.prefill_for_spec(prompt, self._spec_pref_pt(model, pt_row), T, on_chunk, slot=phys, start=start)
+            logits_dev = model.prefill_for_spec(
+                prompt, self._spec_pref_pt(model, pt_row), T, on_chunk, slot=phys, start=start, req_id=req_id
+            )
         finally:
             model._dflash_tap = False
         if _FAST_LOGITS:
@@ -834,10 +836,14 @@ class Qwen36DFlashForCausalLM(Qwen36ForCausalLM):
         pt = torch.as_tensor(page_table)
         start_pos = kwargs.get("start_pos")
         starts = [int(s) for s in start_pos] if start_pos is not None else [0] * N
+        req_ids = kwargs.get("request_ids") or kwargs.get("req_ids")
+        if req_ids is None:
+            req_ids = [None] * N
         out = []
         for u in range(N):
             phys = self._phys[logical[u]]
             start = starts[u]
+            req_id = req_ids[u] if u < len(req_ids) else None
             if start == 0:
                 if dec.active[phys]:
                     # vLLM released the previous occupant before reusing its slot; close its session if not.
@@ -847,7 +853,7 @@ class Qwen36DFlashForCausalLM(Qwen36ForCausalLM):
             prompt = torch.as_tensor(tokens)[u : u + 1, :T].to(torch.int32)
             row = pt[u].reshape(-1).clone()
             logger.info(f"Prefilling slot {phys} up to {T} tokens (start={start}) (TP eager spec prefill)")
-            lt = self._spec_prefill(model, dec, phys, prompt, T, row, start=start)
+            lt = self._spec_prefill(model, dec, phys, prompt, T, row, start=start, req_id=req_id)
             out.append(lt.view(1, 1, -1))
             self._pending[phys] = (T, row)
         logger.info(f"Finished prefill of {N} request(s), starting decode...")

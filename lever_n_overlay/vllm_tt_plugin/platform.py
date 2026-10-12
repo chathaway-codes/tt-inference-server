@@ -1815,7 +1815,15 @@ class TTPlatform(Platform):
             if model_capabilities
             else False
         )
-        if is_block_output_model and supports_prefix_caching:
+        allow_prefix_caching_for_block = (
+            os.environ.get("QWEN_PREFIX_REUSE") == "1"
+            or is_tt_adaptive_block_output_model(vllm_config)
+        )
+        if (
+            is_block_output_model
+            and supports_prefix_caching
+            and not allow_prefix_caching_for_block
+        ):
             raise ValueError(
                 f"Model {model_class.__module__}.{model_class.__name__} "
                 "declares model_capabilities['supports_prefix_caching']=True, "

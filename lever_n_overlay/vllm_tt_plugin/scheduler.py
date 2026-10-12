@@ -180,11 +180,24 @@ class TTScheduler(AsyncScheduler):
                 "Block-output accounting requires upstream to reserve exactly "
                 "one sampled-token placeholder"
             )
-            assert not self.kv_cache_manager.enable_caching, (
-                "Block-output models bypass the kv_cache_manager.cache_blocks "
-                "call made by AsyncScheduler._update_request_with_output and "
-                "must disable prefix caching"
-            )
+            if not (
+                os.environ.get("QWEN_PREFIX_REUSE") == "1"
+                or self._is_adaptive_block
+            ):
+                assert not self.kv_cache_manager.enable_caching, (
+                    "Block-output models bypass the kv_cache_manager.cache_blocks "
+                    "call made by AsyncScheduler._update_request_with_output and "
+                    "must disable prefix caching"
+                )
+
+        # Qwen prefix reuse (G1): scripts/ci/qwen_prefix_scheduler_patch.py wraps this
+        # instance (trim, cap, per-step commit, eviction coupling, free and reset hooks) when
+        # QWEN_PREFIX_REUSE=1 and refuses to start where reuse would not be exact. Unset,
+        # nothing is imported and nothing changes.
+        if os.environ.get("QWEN_PREFIX_REUSE") == "1":
+            from .qwen_prefix_scheduler_patch import maybe_install as _qwen_prefix_install
+
+            _qwen_prefix_install(self)
 
     def set_forced_mode(self, mode: TTSchedulingMode) -> None:
         self._forced_mode = mode

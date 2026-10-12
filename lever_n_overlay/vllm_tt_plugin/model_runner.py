@@ -1693,6 +1693,15 @@ class TTModelRunner:
         # State follows the request, not the row (``self._req_state_slot``), which
         # subsumes the batch's condense-move remap.
         input_batch.reset_slot_remap()
+        # Qwen prefix reuse (G1, qwen_prefix_runner_patch): the model finds each prefill
+        # row's committed grant by request id. Only under QWEN_PREFIX_REUSE=1.
+        import os as _qwen_prefix_os
+
+        prefill_request_ids = (
+            list(row_req_ids)
+            if is_prompt and _qwen_prefix_os.environ.get("QWEN_PREFIX_REUSE") == "1"
+            else None
+        )
         prefill_empty_slots = None
         slot_remap = None
         if is_prompt:
@@ -1742,6 +1751,7 @@ class TTModelRunner:
             # state. Stateless models ignore it.
             prefill_empty_slots=prefill_empty_slots,
             intermediate_prefill_mask=intermediate_prefill_mask,
+            prefill_request_ids=prefill_request_ids,
         )
 
     def build_model_input(
@@ -2396,6 +2406,9 @@ class TTModelRunner:
                     empty_slots.append(dp_rank * stride + i)
         if empty_slots is not None:
             kwargs["empty_slots"] = list(empty_slots)
+        if model_input.prefill_request_ids is not None:
+            # Qwen prefix reuse (G1, qwen_prefix_runner_patch): the row request ids.
+            kwargs["request_ids"] = list(model_input.prefill_request_ids)
 
         if self.request_specific_rope:
             tt_out, rope_deltas = self.model.prefill_forward(**kwargs)

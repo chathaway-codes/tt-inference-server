@@ -17,11 +17,283 @@ from tqdm import tqdm
 
 import ttnn
 from models.common.rmsnorm import RMSNorm
-from models.demos.blackhole.qwen36.tt import masked_bucket_trace as mbt
+try:
+    from models.demos.blackhole.qwen36.tt import masked_bucket_trace as mbt
+except ImportError:
+    try:
+        from . import masked_bucket_trace as mbt
+    except ImportError:
+        try:
+            import masked_bucket_trace as mbt
+        except ImportError:
+            mbt = None
 from models.demos.blackhole.qwen36.tt.layer import Qwen36DecoderLayer
 from models.demos.blackhole.qwen36.tt.model_config import Qwen36ModelArgs
 from models.demos.blackhole.qwen36.tt.rope import Qwen36RoPESetup
 from models.tt_transformers.tt.common import Mode, get_block_size, num_blocks_in_seq
+
+# ---- Prefix reuse (G1): the model side of the TT prefix-reuse design, section 2.0.1 item 4. ----
+# Staged by scripts/ci/qwen_prefix_model_patch.py. Only qwen36_vllm's QWEN_PREFIX_REUSE route
+# (Qwen36Model._qwen_prefix_prefill_slots) reaches this code; the stock methods take the new
+# keyword arguments at defaults that reproduce their old behaviour exactly.
+import time as _qwen_time
+
+_QWEN_PREFIX_REGISTRY_KEY = "_qwen_prefix_registry"
+_QWEN_PREFIX_CHUNK = 2048
+# The attributes the C2 fast path's prefill captures bind on the model while they are open
+# (dflash_prefill_window, dspark_prefill, target_features). Those captures wrap only the stock
+# prefill_paged_slots* entries, so a prefill through the prefix route would leave the admitted
+# GDN slot unrecorded: the route refuses to run while any of them is bound.
+_QWEN_PREFIX_FAST_PATH_MARKERS = (
+    "_qwen_dflash_prefill_capture",
+    "_qwen_dspark_prefill_capture",
+    "_qwen_target_feature_capture",
+)
+# Sticky sessions: the one capture that may bind while the route runs, and only when it declares
+# records_prefix_route (dflash_prefill_window.PrefillWindowCapture built with prefix_route=True
+# wraps this route by name, so the GDN slot it writes is recorded like prefill_paged_slots').
+_QWEN_PREFIX_RECORDING_CAPTURE = "_qwen_dflash_prefill_capture"
+_QWEN_PREFIX_WARNED = set()
+
+
+def _qwen_prefix_warn_once(key, message):
+    if key not in _QWEN_PREFIX_WARNED:
+        _QWEN_PREFIX_WARNED.add(key)
+        logger.warning(message)
+
+
+# G2's DRAM reading (qwen_prefix_model_patch's docstring): logged once per point per process.
+_QWEN_PREFIX_DRAM_LOGGED = set()
+
+
+def _qwen_prefix_dram_statistics(tensor):
+    """Each chip's DRAM allocator figures, in bytes over all banks, read through the chips `tensor`
+    spans: serving_buffer_pool.dram_statistics(ttnn, tensor), line for line (test_qwen_prefix_model_runtime
+    holds the two equal). A ttnn without the memory view, or one that refuses it, reports the reason."""
+    try:
+        report = []
+        for chip, shard in enumerate(ttnn.get_device_tensors(tensor)):
+            view = ttnn.get_memory_view(shard.device(), ttnn.BufferType.DRAM)
+            banks = int(view.num_banks)
+            report.append(
+                dict(
+                    chip=chip,
+                    banks=banks,
+                    allocated=int(view.total_bytes_allocated_per_bank) * banks,
+                    free=int(view.total_bytes_free_per_bank) * banks,
+                    largest_free=int(view.largest_contiguous_bytes_free_per_bank) * banks,
+                    total=int(view.total_bytes_per_bank) * banks,
+                )
+            )
+        return report
+    except Exception as failure:
+        return dict(unavailable="%s: %s" % (type(failure).__name__, str(failure)[:120]))
+
+
+def _qwen_prefix_format_dram(statistics):
+    """serving_buffer_pool.format_dram: per chip, allocated / free / largest free block of the total."""
+    if isinstance(statistics, dict):
+        return "unavailable (%s)" % statistics.get("unavailable", "no statistics")
+    gigabyte, megabyte = 1e9, 1e6
+    return "; ".join(
+        "chip%d allocated=%.2fGB free=%.2fGB largest_free=%.1fMB of %.2fGB"
+        % (
+            chip["chip"],
+            chip["allocated"] / gigabyte,
+            chip["free"] / gigabyte,
+            chip["largest_free"] / megabyte,
+            chip["total"] / gigabyte,
+        )
+        for chip in statistics
+    )
+
+
+def _qwen_prefix_dram(point, tensor):
+    """Log "[PINDIAG] dram after <point>: <reading>" once per point in this process, and only under
+    QWEN_PREFIX_REUSE=1. Allocator views only: no allocation, no program, no synchronize. Never raises."""
+    if point in _QWEN_PREFIX_DRAM_LOGGED or os.environ.get("QWEN_PREFIX_REUSE") != "1":
+        return
+    _QWEN_PREFIX_DRAM_LOGGED.add(point)
+    try:
+        reading = _qwen_prefix_format_dram(_qwen_prefix_dram_statistics(tensor))
+    except Exception as failure:
+        reading = "unavailable (%s: %s)" % (type(failure).__name__, str(failure)[:120])
+    logger.info(f"[PINDIAG] dram after {point}: {reading}")
+
+
+def _qwen_prefix_registry():
+    """The scheduler graft's registry (qwen_prefix_registry.PrefixRegistry), parked under a fixed
+    sys.modules key (None when absent).
+
+    The adapter. The model uses only: registry.grant_for(req_id) -> None or a grant with req_id,
+    q (0 on a miss), checkpoint (pos, token_ids, rec, carry; required when q > 0) and plan (the
+    boundaries to capture, as (pos, key) pairs or bare positions); registry.capture(req_id, pos,
+    rec=, carry=, nbytes=, ms=, loop_pos=), which must not raise and refuses a state not taken
+    after exactly pos tokens; registry.note_restore(ms); registry.enable_mid_loop_capture(); and
+    the optional registry.stats dict. If the registry's API moves, change these module functions,
+    not the model methods."""
+    import sys as _qwen_sys
+
+    return getattr(_qwen_sys.modules.get(_QWEN_PREFIX_REGISTRY_KEY), "registry", None)
+
+
+def _qwen_prefix_note(registry, name, value):
+    stats = getattr(registry, "stats", None)
+    if isinstance(stats, dict) and name in stats:
+        stats[name] += value
+
+
+def _qwen_prefix_put(registry, req_id, pos, rec, carry, nbytes, ms=None):
+    """File the state a chunk loop handed over at `pos` - the tokens the loop had run when it
+    called on_capture, which is what the registry holds the capture to (loop_pos)."""
+    try:
+        return registry.capture(req_id, pos, rec=rec, carry=carry, nbytes=nbytes, ms=ms, loop_pos=pos)
+    except Exception as error:  # the registry guards itself; a capture never fails a request (S7)
+        _qwen_prefix_note(registry, "capture_failures", 1)
+        logger.warning(f"[PREFIX] capture not stored req={req_id} pos={pos}: {error!r}")
+        return None
+
+
+def _qwen_prefix_restored(registry, ms):
+    note = getattr(registry, "note_restore", None)
+    if callable(note):
+        note(ms)
+    else:
+        _qwen_prefix_note(registry, "restore_ms", ms)
+
+
+def _qwen_prefix_declare_mid_loop(create=False):
+    """Tell the scheduler graft this model captures inside its chunk loop (at a planned boundary
+    below the loop's drain, after exactly that many tokens), so it plans the gap boundary and a
+    resumed request's prompt boundary too. The warmup runs before vLLM builds the scheduler, so
+    with create it declares on the registry holder (created as a bare module when absent), which
+    qwen_prefix_registry.shared_registry honours when it creates the registry."""
+    import sys as _qwen_sys
+    import types as _qwen_types
+
+    holder = _qwen_sys.modules.get(_QWEN_PREFIX_REGISTRY_KEY)
+    if holder is None:
+        if not create:
+            return
+        holder = _qwen_types.ModuleType(_QWEN_PREFIX_REGISTRY_KEY)
+        _qwen_sys.modules[_QWEN_PREFIX_REGISTRY_KEY] = holder
+    holder.mid_loop_capture = True
+    enable = getattr(getattr(holder, "registry", None), "enable_mid_loop_capture", None)
+    if callable(enable):
+        enable()
+
+
+def _qwen_prefix_digests(rec_snap, conv_snap, logits):
+    """(slot_sha, logits_sha): sha256 (32 hex) of a row's end-of-prefill GDN slot state - every GDN
+    layer's rec_state, then its conv_states - and of its last-position logits, as the host copies
+    every prefill already makes hold them. A hit and its salted cold twin must agree on both."""
+    import hashlib as _qwen_hashlib
+
+    gdn = _qwen_hashlib.sha256()
+    for rec in rec_snap:
+        gdn.update(_qwen_prefix_bytes(rec))
+    for convs in conv_snap:
+        for c in convs:
+            gdn.update(_qwen_prefix_bytes(c))
+    return gdn.hexdigest()[:32], _qwen_hashlib.sha256(_qwen_prefix_bytes(logits)).hexdigest()[:32]
+
+
+def _qwen_prefix_plan(grant):
+    positions = set()
+    for item in getattr(grant, "plan", None) or ():
+        positions.add(int(item[0] if isinstance(item, (tuple, list)) else item))
+    return sorted(positions)
+
+
+class _QwenPrefixRow:
+    """One prefill row's reuse decision, checked before any row of the step runs."""
+
+    __slots__ = ("index", "req_id", "start", "actual", "rec", "carry", "plan", "dropped", "granted")
+
+    def __init__(self, index, req_id, start, actual, rec=None, carry=None, plan=(), dropped=(), granted=False):
+        self.index = index
+        self.req_id = req_id
+        self.start = start
+        self.actual = actual
+        self.rec = rec
+        self.carry = carry
+        self.plan = list(plan)
+        self.dropped = list(dropped)
+        self.granted = granted
+
+
+def _qwen_prefix_state_spec(rec_list, carry_list):
+    """Per GDN layer: the host-view (shape, dtype) of rec_state and of conv_carry."""
+    return [(tuple(r.shape), r.dtype, tuple(c.shape), c.dtype) for r, c in zip(rec_list, carry_list)]
+
+
+def _qwen_prefix_row(index, req_id, start, actual, toks, registry, chunk_size, spec):
+    """Check one row against its committed grant (F2) and return what the model runs.
+
+    spec is the bound scratch's GDN state as _qwen_prefix_warm_restore read it
+    (_qwen_prefix_state_spec), or None before the warmup chose a restore path. A checkpoint is
+    checked against it here - layer count, shapes and dtypes - so a bad checkpoint in any row
+    stops the step before any row runs.
+
+    The scheduler graft commits a grant only for a request the step's output admits at
+    start_pos == Q, so every refusal here is a broken invariant, not a miss: the engine stops
+    rather than rewrite KV blocks other conversations share or resume from another state."""
+    start = int(start)
+    where = f"prefix reuse: row {index} req={req_id} start_pos={start} L={actual}"
+    if not 0 <= start < actual:
+        raise AssertionError(f"{where}: start_pos is outside the prompt")
+    grant = registry.grant_for(req_id) if registry is not None and req_id is not None else None
+    if grant is None:
+        if start:
+            if registry is None:
+                reason = "no prefix registry is installed"
+            elif req_id is None:
+                reason = "the runner passed no request id"
+            else:
+                reason = "no committed grant"
+            raise AssertionError(f"{where}: resumed with {reason}; refusing to rewrite shared blocks")
+        return _QwenPrefixRow(index, req_id, 0, actual)
+    if getattr(grant, "req_id", req_id) != req_id:
+        raise AssertionError(f"{where}: the committed grant belongs to {grant.req_id}")
+    q = int(grant.q)
+    if q != start:
+        raise AssertionError(f"{where}: stale grant Q={q}; the runner resumed at start_pos")
+    rec = carry = None
+    if q:
+        if q % chunk_size:
+            raise AssertionError(f"{where}: Q={q} is not a {chunk_size}-token chunk boundary")
+        checkpoint = getattr(grant, "checkpoint", None)
+        if checkpoint is None or int(checkpoint.pos) != q:
+            raise AssertionError(f"{where}: the grant carries no checkpoint at Q={q}")
+        if list(checkpoint.token_ids) != toks[0, :q].tolist():
+            raise AssertionError(f"{where}: the checkpoint's token ids differ from the row's prompt")
+        rec, carry = checkpoint.rec, checkpoint.carry
+        if rec is None or carry is None:
+            raise AssertionError(f"{where}: the checkpoint holds no GDN state")
+        if spec is None:
+            raise AssertionError(
+                f"{where}: GDN restore before _qwen_prefix_warm_restore chose a path "
+                "(a first compile after the traces are parked hangs the engine)"
+            )
+        if len(rec) != len(spec) or len(carry) != len(spec):
+            raise AssertionError(
+                f"{where}: the checkpoint holds {len(rec)}/{len(carry)} GDN states, the model {len(spec)}"
+            )
+        for layer, (want, got) in enumerate(zip(spec, _qwen_prefix_state_spec(rec, carry))):
+            if got != want:
+                raise AssertionError(
+                    f"{where}: GDN layer {layer} checkpoint (rec shape, dtype, carry shape, dtype) {got} "
+                    f"is not the scratch's {want}"
+                )
+    last = actual // chunk_size * chunk_size
+    plan, dropped = [], []
+    for pos in _qwen_prefix_plan(grant):
+        (plan if q < pos <= last and pos % chunk_size == 0 else dropped).append(pos)
+    return _QwenPrefixRow(index, req_id, q, actual, rec, carry, plan, dropped, granted=True)
+
+
+def _qwen_prefix_bytes(tensor):
+    return tensor.detach().contiguous().view(torch.uint8).numpy().tobytes()
 
 
 @dataclass
@@ -1137,7 +1409,9 @@ class Qwen36Model:
         for t in (tok_tt, cos, sin, pt_full, pt_chunk, out):
             ttnn.deallocate(t)
 
-    def prefill_for_spec(self, token_ids, page_table, actual_len, on_chunk, slot=0, device_copy=None, start=0):
+    def prefill_for_spec(
+        self, token_ids, page_table, actual_len, on_chunk, slot=0, device_copy=None, start=0, req_id=None
+    ):
         """Chunked prompt prefill for speculative decode; hands each chunk's hidden to ``on_chunk``.
 
         Uses the same 2048-token chunking as the demo. Prefilling the whole prompt as one masked
@@ -1166,6 +1440,33 @@ class Qwen36Model:
         """
         assert self.use_tp, "prefill_for_spec is the TP path (use_tp_path)"
         assert 0 <= slot < self.args.max_batch_size, f"slot {slot} out of range [0,{self.args.max_batch_size})"
+
+        prefix_reuse = os.environ.get("QWEN_PREFIX_REUSE") == "1"
+        row = None
+        registry = None
+        if prefix_reuse and (req_id is not None or start > 0):
+            registry = _qwen_prefix_registry()
+            if registry is not None or start > 0:
+                row = _qwen_prefix_row(
+                    0,
+                    req_id,
+                    start,
+                    actual_len,
+                    token_ids,
+                    registry,
+                    self._chunked_chunk_size or _QWEN_PREFIX_CHUNK,
+                    getattr(self, "_qwen_prefix_state_spec", None),
+                )
+
+        captured = []
+        on_capture_hook = None
+        if row is not None and row.plan and registry is not None:
+            plan_set = frozenset(row.plan)
+            on_capture_hook = lambda pos, _row=row, _out=captured, _pset=plan_set: (
+                self._qwen_prefix_capture(registry, _row.req_id, pos, _out) if pos in _pset else None
+            )
+
+        began = _qwen_time.perf_counter()
         if self.args.max_batch_size > 1:
             dev_copy = self._spec_slot_device_copy() if device_copy is None else bool(device_copy)
             _timing = os.environ.get("QWEN36_PREFILL_TIMING", "0") == "1"
@@ -1179,8 +1480,16 @@ class Qwen36Model:
                 dn.sync_conv_taps()
             _t0 = time.perf_counter() if _timing else 0.0
             prev = self._bind_gdn_prefill_scratch()
+            restored_ms = None
             try:
-                logits = self._prefill_for_spec_b1(token_ids, page_table, actual_len, on_chunk, start=start)
+                if row is not None and row.start:
+                    _trestore = _qwen_time.perf_counter()
+                    self._qwen_prefix_restore(row.rec, row.carry)
+                    restored_ms = (_qwen_time.perf_counter() - _trestore) * 1000.0
+                    _qwen_prefix_restored(registry, restored_ms)
+                logits = self._prefill_for_spec_b1(
+                    token_ids, page_table, actual_len, on_chunk, start=start, on_capture=on_capture_hook
+                )
                 if _timing:
                     ttnn.synchronize_device(self.device)
                 _t1 = time.perf_counter() if _timing else 0.0
@@ -1212,16 +1521,41 @@ class Qwen36Model:
                     f"[SPEC_PREFILL_TIMING] slot={slot} T={int(actual_len)} dev_copy={int(dev_copy)} "
                     f"total={1e3 * (_t2 - _t0):.1f} ms prefill={1e3 * (_t1 - _t0):.1f} slot_write={1e3 * (_t2 - _t1):.1f}"
                 )
+            if row is not None:
+                elapsed = (_qwen_time.perf_counter() - began) * 1000.0
+                restored = "-" if restored_ms is None else f"{restored_ms:.1f}"
+                logger.info(
+                    f"[PREFIX] spec_prefill req={row.req_id} slot={slot} grant={'committed' if row.granted else 'none'} "
+                    f"Q={row.start} L={actual_len} plan={row.plan} restored_ms={restored} "
+                    f"captured=[{','.join(captured)}] dropped={row.dropped} ms={elapsed:.1f}"
+                )
             return logits
-        return self._prefill_for_spec_b1(token_ids, page_table, actual_len, on_chunk, start=start)
 
-    def _prefill_for_spec_b1(self, token_ids, page_table, actual_len, on_chunk, start=0):
+        restored_ms = None
+        if row is not None and row.start:
+            _trestore = _qwen_time.perf_counter()
+            self._qwen_prefix_restore(row.rec, row.carry)
+            restored_ms = (_qwen_time.perf_counter() - _trestore) * 1000.0
+            _qwen_prefix_restored(registry, restored_ms)
+        logits = self._prefill_for_spec_b1(
+            token_ids, page_table, actual_len, on_chunk, start=start, on_capture=on_capture_hook
+        )
+        if row is not None:
+            elapsed = (_qwen_time.perf_counter() - began) * 1000.0
+            restored = "-" if restored_ms is None else f"{restored_ms:.1f}"
+            logger.info(
+                f"[PREFIX] spec_prefill req={row.req_id} slot={slot} grant={'committed' if row.granted else 'none'} "
+                f"Q={row.start} L={actual_len} plan={row.plan} restored_ms={restored} "
+                f"captured=[{','.join(captured)}] dropped={row.dropped} ms={elapsed:.1f}"
+            )
+        return logits
+
+    def _prefill_for_spec_b1(self, token_ids, page_table, actual_len, on_chunk, start=0, on_capture=None):
         """prefill_for_spec's body: one B=1 prompt into whatever GDN state is currently bound."""
         chunk_size = self._chunked_chunk_size or 2048
         num_full = actual_len // chunk_size
         tail_real = actual_len - num_full * chunk_size
-        if start == 0:
-            self._build_request_rope(token_ids[:, :actual_len], None)
+        self._build_request_rope(token_ids[:, :actual_len], None)
 
         if num_full == 0:
             logits, hidden = self.prefill_masked_bucket(
@@ -1244,6 +1578,8 @@ class Qwen36Model:
                 token_ids[:, cs : cs + chunk_size], chunk_size, cs, page_table, chunk_size, flex_sdpa=True
             )
             ttnn.synchronize_device(self.device)
+            if on_capture is not None:
+                on_capture((c + 1) * chunk_size)
             # Not the last chunk, or there is a tail after it: the base hidden is consumed here.
             if c < num_full - 1 or tail_real > 0:
                 on_chunk(last_hidden, cs, chunk_size)
@@ -2672,31 +3008,9 @@ class Qwen36Model:
         longer exist. So the spec bindings are detached before the reset and re-attached after it; reset_state finds
         nothing to free. The caller sets dn.B back and rebinds rec_state / conv_states / conv_carry / _zero_* itself.
         """
-        keep = (
-            dn._spec_cfgs,
-            dn._spec_ring,
-            dn._spec_rows,
-            dn._spec_zero_row,
-            dn._conv_win_buf,
-            dn._conv_taps_stale,
-            dn._conv_win_stale,
-        )
-        # The fused plain-decode conv's packed history (conv_hist_packed, [n_dev*B, Nv, 4, 32, 32]) belongs to the
-        # BATCHED state and the decode traces read it at a baked address: reset_state at the scratch width would
-        # otherwise _store_conv_hist_packed a width-row zero buffer over it -- a shape mismatch, so it deallocates the
-        # batched buffer and replaces it, and every parked decode trace keeps reading the freed address. Detach it
-        # too; the scratch never decodes, so its own packed history is dropped right after the reset.
-        keep_hist = (dn.conv_hist_packed, dn._hist_packed_valid)
-        dn._spec_cfgs, dn._spec_ring, dn._spec_rows, dn._spec_zero_row, dn._conv_win_buf = {}, None, None, None, None
-        dn.conv_hist_packed = None
-        try:
-            dn.B = width
-            dn.reset_state()
-        finally:
-            if dn.conv_hist_packed is not None:
-                ttnn.deallocate(dn.conv_hist_packed)
-            dn.conv_hist_packed, dn._hist_packed_valid = keep_hist
-            (
+        has_spec = hasattr(dn, "_spec_cfgs")
+        if has_spec:
+            keep = (
                 dn._spec_cfgs,
                 dn._spec_ring,
                 dn._spec_rows,
@@ -2704,7 +3018,30 @@ class Qwen36Model:
                 dn._conv_win_buf,
                 dn._conv_taps_stale,
                 dn._conv_win_stale,
-            ) = keep
+            )
+            dn._spec_cfgs, dn._spec_ring, dn._spec_rows, dn._spec_zero_row, dn._conv_win_buf = {}, None, None, None, None
+        has_hist = hasattr(dn, "conv_hist_packed")
+        if has_hist:
+            keep_hist = (dn.conv_hist_packed, getattr(dn, "_hist_packed_valid", False))
+            dn.conv_hist_packed = None
+        try:
+            dn.B = width
+            dn.reset_state()
+        finally:
+            if has_hist:
+                if dn.conv_hist_packed is not None:
+                    ttnn.deallocate(dn.conv_hist_packed)
+                dn.conv_hist_packed, dn._hist_packed_valid = keep_hist
+            if has_spec:
+                (
+                    dn._spec_cfgs,
+                    dn._spec_ring,
+                    dn._spec_rows,
+                    dn._spec_zero_row,
+                    dn._conv_win_buf,
+                    dn._conv_taps_stale,
+                    dn._conv_win_stale,
+                ) = keep
 
     def _alloc_gdn_scratch_b1(self):
         """Allocate a dedicated B=1 GDN state set on every GDN layer, distinct from the
@@ -3226,7 +3563,7 @@ class Qwen36Model:
         ``valid_lens`` optional. Returns N host torch logits [1,1,vocab] in call order. Call
         allocate_kv_caches(batch_size=B) + batched warmup first; long prompts use prefill_traced_chunked via pre-warmed programs (no post-park compile).
         """
-        assert self.use_tp, "prefill_paged_slots is the TP code path (use_tp_path)"
+        assert getattr(self, "use_tp", getattr(self, "num_devices", 1) > 1), "prefill_paged_slots is the TP code path (use_tp_path)"
         N = len(token_ids_list)
         assert len(empty_slots) == N, "one slot per request"
         pt = page_table if isinstance(page_table, torch.Tensor) else ttnn.to_torch(page_table)
@@ -3657,7 +3994,385 @@ class Qwen36Model:
                 )
                 for m in range(dn.K)
             ]
-            dn.write_slot(slot, rec, convs, sync_hist=sync_hist)
+            try:
+                dn.write_slot(slot, rec, convs, sync_hist=sync_hist)
+            except TypeError:
+                dn.write_slot(slot, rec, convs)
+
+    def _qwen_prefix_prefill_slots(
+        self, token_ids_list, page_table, empty_slots, valid_lens=None, starts=None, req_ids=None
+    ):
+        """prefill_paged_slots with conversation prefix reuse (QWEN_PREFIX_REUSE=1; G1).
+
+        Rows run in sequence into the persistent B=1 scratch exactly as prefill_paged_slots runs
+        them, except:
+          * a row granted a hit at Q (== the runner's start_pos) restores its GDN checkpoint
+            (rec_state + conv_carry) into the bound scratch in place and runs the chunk loop from
+            Q/2048, then the same tail; KV [0, Q) is vLLM's cached blocks. Same chunk program, same
+            inputs from Q on, so KV [Q, L), the slot and the logits equal a cold prefill's (design
+            section 2.0.4);
+          * at each planned 2048-token boundary the loop hands the scratch's state to the registry,
+            which keys it by vLLM's block hash at that boundary.
+        Every row is checked before any row runs (_qwen_prefix_row): a stale or missing grant, or a
+        checkpoint that does not fit the scratch, is an assertion, never a silent rewrite of blocks
+        another conversation shares.
+
+        The name stays outside prefill_paged_slots* on purpose: the C2 fast path's prefill capture
+        enumerates that prefix on the model and refuses any entry it does not know
+        (dflash_prefill_window.BATCHED_PREFILL_ENTRIES), on every profile of the image. It wraps
+        only the stock entries, so this route refuses to run while a fast-path capture is bound -
+        unless that capture is the DFlash prefill capture of sticky sessions and declares
+        records_prefix_route: it wraps this route by name and records the slot it writes.
+        """
+        for marker in _QWEN_PREFIX_FAST_PATH_MARKERS:
+            if not hasattr(self, marker):
+                continue
+            if marker == _QWEN_PREFIX_RECORDING_CAPTURE and (
+                getattr(getattr(self, marker), "records_prefix_route", False) is True
+            ):
+                continue
+            raise AssertionError(
+                f"prefix reuse: {marker} is bound - QWEN_PREFIX_REUSE=1 does not run under the C2 fast path, "
+                "whose prefill capture records the GDN slot only through prefill_paged_slots unless it "
+                "declares records_prefix_route"
+            )
+        if self.num_devices <= 1:
+            raise AssertionError("prefix reuse: _qwen_prefix_prefill_slots is the TP (num_devices>1) path")
+        N = len(token_ids_list)
+        starts = [0] * N if starts is None else [int(s) for s in starts]
+        req_ids = [None] * N if req_ids is None else list(req_ids)
+        if len(empty_slots) != N or len(starts) != N or len(req_ids) != N:
+            raise AssertionError("prefix reuse: one slot, one start_pos and one request id per row")
+        pt = page_table if isinstance(page_table, torch.Tensor) else ttnn.to_torch(page_table)
+        if pt.shape[0] != N:
+            raise AssertionError("prefix reuse: page_table must have one row per request")
+        comp = ttnn.ConcatMeshToTensor(self.mesh_device, dim=0)
+        dn_states = self._qwen_prefix_gdn_layers()
+        registry = _qwen_prefix_registry()
+        if registry is None:
+            _qwen_prefix_warn_once(
+                "registry",
+                f"[PREFIX] QWEN_PREFIX_REUSE=1 but no prefix registry is installed in this process "
+                f"(sys.modules[{_QWEN_PREFIX_REGISTRY_KEY!r}]): every row runs cold and reuse never engages - "
+                "the scheduler graft is missing or runs in another process",
+            )
+        else:
+            _qwen_prefix_declare_mid_loop()
+            # G2's DRAM reading, once per process: the model is warm and the scheduler built the registry.
+            _qwen_prefix_dram("registry", dn_states[0].rec_state if dn_states else None)
+        held = "absent" if registry is None else "present"
+        chunk_size = self._chunked_chunk_size or _QWEN_PREFIX_CHUNK
+        path = "traced" if self._chunked_trace_id is not None else "eager"
+        if path == "eager":
+            # F3 on the eager loop (trace_mode decode_only; G1 v47, run 36246961161): the loop hands its
+            # forwards the page table as the runner built it, and the paged SDPA program is keyed on its
+            # width, so the programs Qwen36ForCausalLM._qwen_prefix_warm_eager compiled at the chunk-input
+            # buffer's width would compile again after the decode trace is parked. Fit it to that width,
+            # as the traced loop and the short-prompt path already do; entries past a prompt's blocks are
+            # never read.
+            pt = self._qwen_prefix_fit_page_table(pt)
+        spec = getattr(self, "_qwen_prefix_state_spec", None)
+        rows = []
+        for u in range(N):
+            toks = token_ids_list[u]
+            if toks.shape[0] != 1:
+                raise AssertionError(f"prefix reuse: request {u}: token_ids must be [1, T_u]")
+            actual = int(valid_lens[u]) if valid_lens is not None else toks.shape[1]
+            if actual < 1:
+                raise AssertionError(f"prefix reuse: request {u}: empty prompt (actual_len={actual})")
+            rows.append(_qwen_prefix_row(u, req_ids[u], starts[u], actual, toks, registry, chunk_size, spec))
+        audit = os.environ.get("QWEN_PREFIX_AUDIT") == "1"
+        digests = audit or os.environ.get("QWEN_PREFIX_DIGESTS") == "1"
+
+        prev = self._bind_gdn_prefill_scratch()
+        host_logits = []
+        per_user_rec = []
+        per_user_conv = []
+        try:
+            for row in rows:
+                u, actual = row.index, row.actual
+                toks = token_ids_list[u]
+                began = _qwen_time.perf_counter()
+                # F3: the program cache before and after every row; any growth after warmup is a
+                # compile after the traces are parked (the #48536 hang hazard).
+                programs_before = self._qwen_prefix_program_cache_entries()
+                restored_ms = None
+                programs = None
+                if row.start:
+                    self._qwen_prefix_restore(row.rec, row.carry)
+                    restored_ms = (_qwen_time.perf_counter() - began) * 1000.0
+                    programs = (programs_before, self._qwen_prefix_program_cache_entries())
+                    _qwen_prefix_restored(registry, restored_ms)
+                captured = []
+                resume = {}
+                if row.start or row.plan:
+                    resume["start"] = row.start
+                if row.plan:
+                    resume["capture_at"] = frozenset(row.plan)
+                    resume["on_capture"] = lambda pos, _row=row, _out=captured: self._qwen_prefix_capture(
+                        registry, _row.req_id, pos, _out
+                    )
+                lg = self.prefill_traced_chunked(toks[:, :actual], pt[u : u + 1], actual_len=actual, **resume)
+                host_logits.append(
+                    ttnn.to_torch(lg, mesh_composer=comp).reshape(-1, self.args.vocab_size)[:1].float().view(1, 1, -1)
+                )
+                ttnn.deallocate(lg)
+                per_user_rec.append([ttnn.to_torch(dn.rec_state, mesh_composer=comp) for dn in dn_states])
+                per_user_conv.append(
+                    [[ttnn.to_torch(c, mesh_composer=comp) for c in dn.conv_states] for dn in dn_states]
+                )
+                if audit:
+                    self._qwen_prefix_audit(row, pt[u : u + 1], per_user_rec[-1], per_user_conv[-1], host_logits[-1])
+                shas = ""
+                if digests:
+                    slot_sha, logits_sha = _qwen_prefix_digests(per_user_rec[-1], per_user_conv[-1], host_logits[-1])
+                    shas = f" slot_sha={slot_sha} logits_sha={logits_sha}"
+                programs_after = self._qwen_prefix_program_cache_entries()
+                elapsed = (_qwen_time.perf_counter() - began) * 1000.0
+                restored = "-" if restored_ms is None else f"{restored_ms:.1f}"
+                logger.info(
+                    f"[PREFIX] row={u} req={row.req_id} path={path} registry={held} "
+                    f"grant={'committed' if row.granted else 'none'} Q={row.start} L={actual} plan={row.plan} "
+                    f"restored_ms={restored} captured=[{','.join(captured)}] dropped={row.dropped} "
+                    f"ms={elapsed:.1f} programs={programs_before}->{programs_after} "
+                    f"programs_across_restore={programs}{shas}"
+                )
+                if programs_before is not None and programs_after is not None and programs_after > programs_before:
+                    _qwen_prefix_note(registry, "program_growth", 1)
+                    logger.warning(
+                        f"[PREFIX] program growth: row={u} req={row.req_id} Q={row.start} L={actual} compiled "
+                        f"{programs_after - programs_before} program(s) after warmup (F3): a compile after the "
+                        "traces are parked is the second-request hang (#48536)"
+                    )
+                if registry is not None and any(":stored:" in item for item in captured):
+                    # G2's second reading, once per process: after the first row that stored a
+                    # checkpoint (host tensors: any change is device memory the capture path kept).
+                    _qwen_prefix_dram("first capture", dn_states[0].rec_state if dn_states else None)
+        finally:
+            # Always rebind the batched decode buffers; the scratch persists (see prefill_paged_slots).
+            self._unbind_gdn_prefill_scratch(prev)
+
+        for u in range(N):
+            self._write_gdn_slot(int(empty_slots[u]), per_user_rec[u], per_user_conv[u])
+        return host_logits
+
+    def _qwen_prefix_gdn_layers(self):
+        return [layer.attention for layer in self.layers if not layer.is_full_attention]
+
+    def _qwen_prefix_program_cache_entries(self):
+        """Program-cache size, for the F3 check that a row compiles nothing (None if unknown; the
+        warmup warns once when it is unknown, so the check never goes blind silently)."""
+        try:
+            return int(self.mesh_device.num_program_cache_entries())
+        except Exception:
+            return None
+
+    def _qwen_prefix_fit_page_table(self, pt):
+        """pt (host [rows, blocks]) zero-padded or clipped to the chunk-input page-table buffer's width -
+        the width the prefill programs were warmed at - exactly as _prefill_traced_chunked_tp fits it;
+        unchanged when no warm allocated that buffer."""
+        buf = getattr(self, "_chunk_full_page_table_buf", None)
+        if buf is None:
+            return pt
+        width = int(buf.shape[-1])
+        if pt.shape[1] < width:
+            return torch.cat([pt, torch.zeros(pt.shape[0], width - pt.shape[1], dtype=pt.dtype)], dim=1)
+        return pt[:, :width]
+
+    def _qwen_prefix_read_scratch(self):
+        """Host copies of the bound scratch's GDN state, per GDN layer: rec_state
+        [num_devices, Nv, Dk, Dv] (fp32 unless QWEN35_GDN_STATE_BF16=1) and conv_carry
+        [num_devices, K-1, qkv_dim_tp]. The same blocking D2H every prefill runs for its slot."""
+        comp = ttnn.ConcatMeshToTensor(self.mesh_device, dim=0)
+        rec, carry, nbytes = [], [], 0
+        for dn in self._qwen_prefix_gdn_layers():
+            r = ttnn.to_torch(dn.rec_state, mesh_composer=comp)
+            c = ttnn.to_torch(dn.conv_carry, mesh_composer=comp)
+            rec.append(r)
+            carry.append(c)
+            nbytes += r.element_size() * r.nelement() + c.element_size() * c.nelement()
+        return rec, carry, nbytes
+
+    def _qwen_prefix_capture(self, registry, req_id, pos, captured):
+        """Capture hook: a chunk loop calls it once the chunk ending at pos has run and the device
+        has synchronized, before any later chunk or the tail. A failure (MemoryError included)
+        skips the checkpoint and is counted; it never fails the request (S7)."""
+        began = _qwen_time.perf_counter()
+        try:
+            rec, carry, nbytes = self._qwen_prefix_read_scratch()
+        except Exception as error:
+            _qwen_prefix_note(registry, "capture_failures", 1)
+            logger.warning(f"[PREFIX] capture skipped req={req_id} pos={pos}: {error!r}")
+            captured.append(f"{pos}:skipped")
+            return
+        ms = (_qwen_time.perf_counter() - began) * 1000.0
+        stored = _qwen_prefix_put(registry, req_id, pos, rec, carry, nbytes, ms)
+        captured.append(f"{pos}:{'stored' if stored is not None else 'refused'}:{ms:.0f}ms")
+
+    def _qwen_prefix_restore(self, rec_list, carry_list, mode=None):
+        """Write a checkpoint into the bound B=1 prefill scratch IN PLACE, so the addresses the
+        chunk trace baked stay valid. rec_state and conv_carry only: every resumed chunk and the
+        tail rewrite all K conv_states (capture_state=True on prefill).
+
+        h2d:  ttnn.copy_host_to_device_tensor, the traced loop's own input path - it allocates
+              nothing and runs no program.
+        copy: from_torch + ttnn.copy (_restore_gdn_scratch's pattern plus the carry); its programs
+              are compiled by _qwen_prefix_warm_restore before any trace is parked.
+        A restore before the warmup chose a path is refused: a first compile after parking is the
+        second-request hang (#48536), not a wrong answer. _qwen_prefix_row already refuses such a
+        row, and a checkpoint that does not fit the scratch, before any row of the step runs.
+
+        Tile padding (UNVERIFIED): a restore writes conv_carry's tile padding as zeros (from_torch);
+        a cold run's carry holds whatever ttnn.copy(conv_new_state, conv_carry) copied from the
+        sliced state. If the next chunk's ttnn.concat([conv_state, qkv], dim=1) read padding, a hit
+        would differ from cold. The warmup compares logical values only and cannot see this; the
+        salted-cold exactness gate on hardware is the check."""
+        mode = mode or getattr(self, "_qwen_prefix_restore_mode", None)
+        if mode not in ("h2d", "copy"):
+            raise AssertionError(
+                "prefix reuse: GDN restore before _qwen_prefix_warm_restore chose a path "
+                "(a first compile after the traces are parked hangs the engine)"
+            )
+        layers = self._qwen_prefix_gdn_layers()
+        if len(rec_list) != len(layers) or len(carry_list) != len(layers):
+            raise AssertionError(
+                f"prefix reuse: checkpoint holds {len(rec_list)}/{len(carry_list)} GDN states, the model {len(layers)}"
+            )
+        mapper = ttnn.ShardTensorToMesh(self.mesh_device, dim=0)
+        held = []
+        for dn, rec, carry in zip(layers, rec_list, carry_list):
+            for host, target in ((rec, dn.rec_state), (carry, dn.conv_carry)):
+                if mode == "h2d":
+                    src = ttnn.from_torch(
+                        host, dtype=target.dtype, layout=ttnn.TILE_LAYOUT, device=None, mesh_mapper=mapper
+                    )
+                    ttnn.copy_host_to_device_tensor(src, target)
+                    held.append(src)  # read by the queued write until the device synchronizes
+                else:
+                    src = ttnn.from_torch(
+                        host, dtype=target.dtype, layout=ttnn.TILE_LAYOUT, device=self.mesh_device, mesh_mapper=mapper
+                    )
+                    ttnn.copy(src, target)
+                    ttnn.deallocate(src)
+        ttnn.synchronize_device(self.device)
+        held.clear()
+
+    def _qwen_prefix_warm_restore(self):
+        """Choose the GDN restore path and compile it before any trace is parked (F3).
+
+        Called with the B=1 scratch bound, from Qwen36ForCausalLM._qwen_prefix_warm on the
+        plugin's compile-only warmup call. Each path is judged on its own: the scratch is zeroed
+        first, the path writes a pattern no other path writes (a per-chip offset plus a per-path
+        offset, never zero, exact in bf16), and the read-back is compared chip by chip. So a path
+        that writes nothing, writes one chip only, or writes one chip's shard to every chip reads
+        back as "differs on chip(s) [...]" - the earlier path's pattern is not there to be read
+        back instead. copy runs first and always, so that falling back to it can never be a first
+        compile after parking; h2d is preferred when it round-trips exactly. QWEN_PREFIX_RESTORE=
+        h2d|copy forces one. The engine refuses to start when no allowed path round-trips. Logical
+        values only: tile padding is not compared (see _qwen_prefix_restore)."""
+        rec_now, carry_now, nbytes = self._qwen_prefix_read_scratch()
+        chips = max(1, int(self.num_devices))
+
+        def pattern(t, offset):
+            rows = t.shape[0]
+            base = (torch.arange(t.numel()) % 64).to(torch.float32).reshape(t.shape) / 8.0
+            chip = (torch.arange(rows) // max(1, rows // chips)).to(torch.float32)
+            return (base + chip.reshape([-1] + [1] * (t.dim() - 1)) * 0.5 + offset).to(t.dtype)
+
+        def chips_differing(back, want):
+            bad = set()
+            for a, b in zip(back, want):
+                if tuple(a.shape) != tuple(b.shape) or a.dtype != b.dtype:
+                    bad.update(range(chips))
+                    continue
+                for chip, (x, y) in enumerate(zip(torch.chunk(a, chips, dim=0), torch.chunk(b, chips, dim=0))):
+                    if not torch.equal(x, y):
+                        bad.add(chip)
+            return sorted(bad)
+
+        results = {}
+        for index, mode in enumerate(("copy", "h2d")):
+            offset = 0.25 * (index + 1)
+            rec_pat = [pattern(t, offset) for t in rec_now]
+            carry_pat = [pattern(t, offset) for t in carry_now]
+            try:
+                self._reset_gdn_state_for_new_sequence()
+                self._qwen_prefix_restore(rec_pat, carry_pat, mode=mode)
+                rec_back, carry_back, _ = self._qwen_prefix_read_scratch()
+                bad = chips_differing(rec_back + carry_back, rec_pat + carry_pat)
+                results[mode] = "exact" if not bad else f"differs on chip(s) {bad}"
+            except Exception as error:
+                results[mode] = f"refused ({type(error).__name__}: {error})"
+        self._reset_gdn_state_for_new_sequence()
+        forced = os.environ.get("QWEN_PREFIX_RESTORE", "")
+        order = (forced,) if forced in ("h2d", "copy") else ("h2d", "copy")
+        chosen = next((mode for mode in order if results.get(mode) == "exact"), None)
+        if chosen is None:
+            raise RuntimeError(
+                f"prefix reuse: no allowed GDN restore path {list(order)} round-trips the prefill scratch: {results}"
+            )
+        self._qwen_prefix_state_spec = _qwen_prefix_state_spec(rec_now, carry_now)
+        self._qwen_prefix_restore_mode = chosen
+        # Before vLLM builds the scheduler: the capture hook takes a boundary below the loop's drain.
+        _qwen_prefix_declare_mid_loop(create=True)
+        programs = self._qwen_prefix_program_cache_entries()
+        if programs is None:
+            logger.warning(
+                "[PINDIAG] prefix: the program-cache size is unavailable "
+                "(mesh_device.num_program_cache_entries); the per-row F3 no-compile check is blind"
+            )
+        kv = self._paged_kv_caches[0][0].dtype if self._paged_kv_caches else None
+        logger.info(
+            f"[PINDIAG] prefix: model warm restore_mode={chosen} results={results} "
+            f"gdn_layers={len(rec_now)} checkpoint_bytes={nbytes} "
+            f"rec={tuple(rec_now[0].shape)}/{rec_now[0].dtype} carry={tuple(carry_now[0].shape)}/{carry_now[0].dtype} "
+            f"kv_dtype={kv} programs={programs}"
+        )
+
+    def _qwen_prefix_audit(self, row, page_row, rec_snap, conv_snap, logits):
+        """QWEN_PREFIX_AUDIT=1: digests the exactness gate compares between a hit and a salted cold
+        run of the same prompt (F3).
+
+        Program-free: each paged KV cache is read to host with to_torch, ONE tensor at a time (all
+        of them at once would need ~34 GB of host RAM), and the row's blocks are selected on host -
+        a device-side slice would compile after the traces are parked. The digests are per
+        2048-token window of the row's logical sequence, over the unpacked values every reader
+        sees, so a hit (new windows from Q/2048) lines up with a cold run (windows from 0). The GDN
+        slot snapshot and the logits get one digest each."""
+        import hashlib as _qwen_hashlib
+
+        actual = row.actual
+        chunk = _QWEN_PREFIX_CHUNK
+        block_size = get_block_size(self._paged_kv_caches)
+        n_blocks = -(-actual // block_size)
+        blocks = torch.as_tensor(page_row[0, :n_blocks], dtype=torch.long)
+        windows = [_qwen_hashlib.sha256() for _ in range(-(-actual // chunk))]
+        heads = ttnn.ConcatMeshToTensor(self.mesh_device, dim=1)
+        for k_cache, v_cache in self._paged_kv_caches:
+            for cache in (k_cache, v_cache):
+                host = ttnn.to_torch(cache, mesh_composer=heads)
+                sel = host.index_select(0, blocks)
+                del host
+                seq = sel.permute(1, 0, 2, 3).reshape(sel.shape[1], n_blocks * block_size, sel.shape[3])
+                for w, digest in enumerate(windows):
+                    digest.update(_qwen_prefix_bytes(seq[:, w * chunk : min((w + 1) * chunk, actual)]))
+                del sel, seq
+        whole = _qwen_hashlib.sha256()
+        for w, digest in enumerate(windows):
+            window_sha = digest.hexdigest()[:32]
+            whole.update(window_sha.encode("ascii"))
+            logger.info(
+                f"[PREFIX-AUDIT] req={row.req_id} Q={row.start} L={actual} window={w} "
+                f"tokens=[{w * chunk},{min((w + 1) * chunk, actual)}) new={int(w * chunk >= row.start)} "
+                f"kv={window_sha}"
+            )
+        # The summary the gate compares (prefix_markers.audit_row): KV over [0, L) as the chain of the
+        # window digests above, the GDN slot and the last-position logits.
+        slot_sha, logits_sha = _qwen_prefix_digests(rec_snap, conv_snap, logits)
+        logger.info(
+            f"[PREFIX-AUDIT] req={row.req_id} Q={row.start} L={actual} kv_range=0:{actual} "
+            f"kv_sha={whole.hexdigest()[:32]} slot_sha={slot_sha} logits_sha={logits_sha}"
+        )
 
     def _remap_gdn_slots(self, remap):
         """Apply a vLLM batch-condense slot_remap to every GDN layer's batched decode state
@@ -3998,7 +4713,7 @@ class Qwen36Model:
         self._prefill_chunk_needs_sync = needs_sync
 
     def _notify_prefill_chunk(self, chunk_start, n_tokens, final, synced=False):
-        fn = self._prefill_chunk_observer
+        fn = getattr(self, "_prefill_chunk_observer", None)
         if fn is None:
             return
         if self._prefill_chunk_sync and not synced:
@@ -4473,8 +5188,9 @@ class Qwen36Model:
                 ttnn.deallocate(pt)
             ttnn.deallocate(k_full)
 
-    def prefill_traced_chunked(self, token_ids, page_table, actual_len, vision_tokens=None,
-                               start=0):
+    def prefill_traced_chunked(
+        self, token_ids, page_table, actual_len, vision_tokens=None, start=0, capture_at=None, on_capture=None
+    ):
         """Prefill by replaying the captured per-chunk trace for each FULL 2048-token chunk, then
         processing the final partial chunk eagerly with minimal padding. Only the real prompt
         (token_ids[:, :actual_len]) is processed. Full chunks replay from the trace; the tail
@@ -4497,17 +5213,38 @@ class Qwen36Model:
         num_full = actual_len // chunk_size
         tail_real = actual_len - num_full * chunk_size
         assert (
-            num_full == 0 or self.use_tp or self._chunked_trace_id is not None
+            num_full == 0 or getattr(self, "use_tp", getattr(self, "num_devices", 1) > 1) or self._chunked_trace_id is not None
         ), "Call capture_prefill_trace_chunked first"
 
         # Stage the per-request RoPE once for the whole prompt (M-RoPE for multimodal, 1D for text).
         # The chunk-replay loops + the masked tail then slice this sequence-indexed table by chunk
         # position, and decode offsets by the stored rope_delta. (The num_full==0 short path below
         # re-stages it inside prefill_masked_bucket; that is idempotent.)
-        # Section 3.1: the RoPE table is staged once, on the first step, for the whole
-        # prompt; later steps slice the same sequence-indexed table by chunk position.
-        if start == 0:
-            self._build_request_rope(token_ids[:, :actual_len], vision_tokens)
+        self._build_request_rope(token_ids[:, :actual_len], vision_tokens)
+
+        # Prefix reuse (G1): resume on a 2048-token boundary with the GDN state already restored
+        # into the scratch, and capture it at planned boundaries. The RoPE table above stays
+        # staged for the whole prompt on every call - a resumed row needs exactly that table.
+        # Nothing below changes a call that passes neither start nor capture_at.
+        _qwen_resume = {}
+        if start or capture_at:
+            if start % chunk_size or not 0 <= start < actual_len:
+                raise AssertionError(
+                    f"prefix reuse: start_pos {start} is not a chunk boundary inside the prompt (L={actual_len})"
+                )
+            if num_full < 1 or self.num_devices <= 1:
+                raise AssertionError(
+                    f"prefix reuse needs the chunked TP path: start={start} L={actual_len} num_full={num_full}"
+                )
+            if capture_at and on_capture is None:
+                raise AssertionError("prefix reuse: capture_at without on_capture")
+            _qwen_resume = dict(
+                chunk_from=start // chunk_size,
+                chunk_to=num_full,
+                do_reset=(start == 0),
+                capture_at=capture_at,
+                on_capture=on_capture,
+            )
 
         # Short prompt (no full chunks): route the whole prompt through the SAME masked
         # fixed-bucket path the long-prompt tail uses. chunk_start=0 makes prefill_masked_bucket
@@ -4539,23 +5276,14 @@ class Qwen36Model:
                 token_ids[:, :actual_len], page_table, actual_len=actual_len, chunk_start=0, vision_tokens=vision_tokens
             )
 
-        if self.use_tp:
+        if getattr(self, "use_tp", getattr(self, "num_devices", 1) > 1):
             # TP long prompt: traced replay preferred; eager masked-bucket fallback if no trace.
             if self._chunked_trace_id is not None:
-                assert start % chunk_size == 0, (
-                    "resumable prefill must continue on a chunk boundary: "
-                    f"start={start} chunk_size={chunk_size}"
-                )
                 return self._prefill_traced_chunked_tp(
-                    token_ids, page_table, actual_len, num_full, chunk_size, tail_real,
-                    vision_tokens=vision_tokens, chunk_from=start // chunk_size,
-                    chunk_to=num_full, do_reset=(start == 0),
+                    token_ids, page_table, actual_len, num_full, chunk_size, tail_real, vision_tokens=vision_tokens,
+                    **_qwen_resume,
                 )
             # Eager fallback: flexible qk=64 SDPA matches traced path.
-            assert start % chunk_size == 0, (
-                "resumable prefill must continue on a chunk boundary: "
-                f"start={start} chunk_size={chunk_size}"
-            )
             return self._prefill_chunked_eager_tp(
                 token_ids,
                 page_table,
@@ -4565,9 +5293,7 @@ class Qwen36Model:
                 tail_real,
                 flex_sdpa=True,
                 vision_tokens=vision_tokens,
-                chunk_from=start // chunk_size,
-                chunk_to=num_full,
-                do_reset=(start == 0),
+                **_qwen_resume,
             )
 
         # Re-zero GDN once; carries across replays + masked tail (chunk_start>0 skips reset).
@@ -4662,7 +5388,8 @@ class Qwen36Model:
 
     def _prefill_chunked_eager_tp(
         self, token_ids, page_table, actual_len, num_full, chunk_size, tail_real, flex_sdpa=True, vision_tokens=None,
-        chunk_from=0, chunk_to=None, do_reset=True, do_tail=True
+        chunk_from=0, chunk_to=None, do_reset=True, do_tail=True,
+        capture_at=None, on_capture=None
     ):
         """TP eager long-prompt prefill via warmed bucket=chunk_size programs.
         Returns logits [1,1,vocab] at actual_len-1."""
@@ -4685,9 +5412,14 @@ class Qwen36Model:
             last_hidden = self._forward_prefill_chunk_masked_tp(
                 token_ids[:, cs : cs + chunk_size], chunk_size, cs, page_table, chunk_size, flex_sdpa=flex_sdpa
             )
+            self._notify_prefill_chunk(cs, chunk_size, final=(tail_real == 0 and c == num_full - 1), synced=False)
             ttnn.synchronize_device(self.device)
-            self._notify_prefill_chunk(cs, chunk_size, final=(tail_real == 0 and c == num_full - 1), synced=True)
+            # Prefix reuse (G1): GDN state at a planned 2048-token boundary, before the tail.
+            if capture_at and (c + 1) * chunk_size in capture_at:
+                on_capture((c + 1) * chunk_size)
         if do_tail and tail_real > 0:
+            # Prefix reuse (F1): a resumed row whose new tokens stay inside one chunk runs no
+            # full chunk here, so last_hidden is still None (a stock prefill always runs one).
             if last_hidden is not None:
                 ttnn.deallocate(last_hidden)
             cs = num_full * chunk_size
@@ -4711,7 +5443,8 @@ class Qwen36Model:
 
     def _prefill_traced_chunked_tp(
         self, token_ids, page_table, actual_len, num_full, chunk_size, tail_real, vision_tokens=None,
-        chunk_from=0, chunk_to=None, do_reset=True, do_tail=True
+        chunk_from=0, chunk_to=None, do_reset=True, do_tail=True,
+        capture_at=None, on_capture=None
     ):
         """TP traced chunk-outer prefill: replay the captured per-chunk trace
         (_forward_prefill_chunk_tp) for each FULL chunk, then run the partial tail through the
@@ -4820,6 +5553,12 @@ class Qwen36Model:
                 _host_refs.clear()
             if (c + 1) % _log_every == 0:
                 logger.info(f"[TP chunk-replay] {c + 1}/{num_full} chunks")
+            # Prefix reuse (G1): GDN state at a planned 2048-token boundary, before any later
+            # chunk or the tail. A gap boundary inside the loop costs this one extra sync.
+            if capture_at and (c + 1) * chunk_size in capture_at:
+                ttnn.synchronize_device(self.device)
+                _host_refs.clear()
+                on_capture((c + 1) * chunk_size)
 
         # Drain any still-in-flight chunk DMAs before returning, so the loop's host input tensors
         # (_host_refs) are not GC'd while a non-blocking execute_trace is still reading them — a
@@ -4855,7 +5594,7 @@ class Qwen36Model:
 
         Trace capture runs forward twice; GDN state is non-idempotent. Must re-zero before each
         real sequence. In-place buffers (_chunk_inplace_state) use _reset_dn_state_inplace."""
-        if self.use_tp:
+        if getattr(self, "use_tp", getattr(self, "num_devices", 1) > 1):
             # TP: reset_state_inplace preserves decode-trace baked addresses.
             for layer in self.layers:
                 if not layer.is_full_attention:

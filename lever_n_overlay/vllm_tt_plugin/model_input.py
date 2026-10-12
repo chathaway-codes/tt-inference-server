@@ -175,3 +175,7 @@ class TTModelInput:
     # must resolve rows through this. ``None`` for lane builds, whose rows are
     # the persistent slots.
     row_req_ids: list[str] | None = None
+
+    # Prefill only, and only under QWEN_PREFIX_REUSE=1 (qwen_prefix_runner_patch): the request
+    # id of each row, in row order. submit_prefill hands it to the model as request_ids.
+    prefill_request_ids: list[str] | None = None

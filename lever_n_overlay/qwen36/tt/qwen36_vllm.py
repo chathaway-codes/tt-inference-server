@@ -33,6 +33,14 @@ _PREFILL_WARMUP_CHUNK = 2048
 _PREFILL_WARMUP_BUCKET = 4096
 _BLOCK_SIZE = 64
 
+# Prefix reuse (G1, TT prefix-reuse design section 2.0.1 item 4; staged by
+# scripts/ci/qwen_prefix_model_patch.py). Read once, at import: the platform reads
+# supports_prefix_caching in check_and_update_config, so the API server and the engine core must
+# agree, and the serving contract sets profile env in every python process of the image.
+_QWEN_PREFIX_REUSE = os.environ.get("QWEN_PREFIX_REUSE") == "1"
+# The runner patch's submit_prefill kwarg: each prefill row's vLLM request id, in row order.
+_QWEN_PREFIX_REQ_IDS_KWARG = "request_ids"
+
 
 def _log_device_memory(mesh_device, tag):
     """Allocator state per buffer type (DRAM / L1 / TRACE) summed over banks, at the points that size a serving
@@ -102,7 +110,9 @@ class Qwen36ForCausalLM(Generator, SupportsMultiModal):
     model_capabilities = _ModelCapabilities(
         {
             "supports_chunked_prefill": True,
-            "supports_prefix_caching": False,
+            # G1: on only with QWEN_PREFIX_REUSE=1, where the model owns GDN checkpoints at 2048-token
+            # boundaries and resumes exactly; the flag and that graft ship in one stage.
+            "supports_prefix_caching": _QWEN_PREFIX_REUSE,
             "supports_async_decode": False,
             "supports_sample_on_device": True,
         }
@@ -332,6 +342,15 @@ class Qwen36ForCausalLM(Generator, SupportsMultiModal):
     def prefill_forward(self, tokens, page_table, kv_cache, prompt_lens, **kwargs):
         """All prefill is model-owned (Generator drives decode only)."""
         model = self.model[0]
+        if _QWEN_PREFIX_REUSE and not ((getattr(model, "use_tp", False) or model.num_devices > 1) and model.args.max_batch_size > 1):
+            # Only the batched TP path resumes; the others ignore start_pos and would rewrite
+            # KV blocks other conversations share.
+            _qwen_starts = kwargs.get("start_pos")
+            if _qwen_starts is not None and any(int(s) > 0 for s in _qwen_starts):
+                raise AssertionError(
+                    "prefix reuse: a resumed prefill reached the unbatched path "
+                    f"(num_devices={model.num_devices}, max_batch_size={model.args.max_batch_size})"
+                )
         if os.environ.get("QWEN36_PREFILL_DEBUG", "0") == "1":
             # p1b nondeterminism triage: what vLLM actually hands the model (page-table row incl. stale entries).
             pt_dbg = page_table if isinstance(page_table, torch.Tensor) else ttnn.to_torch(page_table)
@@ -343,7 +362,7 @@ class Qwen36ForCausalLM(Generator, SupportsMultiModal):
                     f"{int(prompt_lens[u]) if prompt_lens is not None else None} pt_width={row.numel()} nonzero={nz} "
                     f"pt[:6]={row[:6].tolist()} empty_slots={kwargs.get('empty_slots')} start_pos={kwargs.get('start_pos')}"
                 )
-        if model.use_tp and model.args.max_batch_size > 1:
+        if getattr(model, "use_tp", model.num_devices > 1) and model.args.max_batch_size > 1:
             # Batched text prefill into decode slots (MM is B=1). Require real visual data, not a
             # non-None empty pixel_values placeholder from vLLM on text requests.
             assert not self._has_visual(kwargs, "pixel_values") and not self._has_visual(
@@ -352,12 +371,22 @@ class Qwen36ForCausalLM(Generator, SupportsMultiModal):
                 "batched (max_num_seqs>1) serving is text-only; multimodal is single-sequence "
                 "(max_concurrency=1). Run the model at max_num_seqs=1 for image/video requests."
             )
+            if _QWEN_PREFIX_REUSE:
+                return self._prefill_forward_tp_batched(
+                    model,
+                    tokens,
+                    page_table,
+                    prompt_lens,
+                    kwargs.get("empty_slots"),
+                    start_pos=kwargs.get("start_pos"),
+                    req_ids=kwargs.get(_QWEN_PREFIX_REQ_IDS_KWARG),
+                )
             return self._prefill_forward_tp_batched(
                 model, tokens, page_table, prompt_lens, kwargs.get("empty_slots"),
                 start_pos=kwargs.get("start_pos"),
             )
         vision_tokens = self._compute_vision_tokens(model, kwargs)
-        if model.use_tp:
+        if getattr(model, "use_tp", model.num_devices > 1):
             return self._prefill_forward_tp(model, tokens, page_table, prompt_lens, vision_tokens=vision_tokens)
         seq_len = int(prompt_lens[0]) if prompt_lens is not None else tokens.shape[1]
         logger.info(f"Prefilling User 1 up to {seq_len} tokens")
@@ -421,8 +450,9 @@ class Qwen36ForCausalLM(Generator, SupportsMultiModal):
         logger.info(f"Finished prefill up to {T} tokens, starting decode...")
         return logits, torch.zeros(1, dtype=torch.long)
 
-    def _prefill_forward_tp_batched(self, model, tokens, page_table, prompt_lens, empty_slots,
-                                    start_pos=None):
+    def _prefill_forward_tp_batched(
+        self, model, tokens, page_table, prompt_lens, empty_slots, start_pos=None, req_ids=None
+    ):
         """TP batched (max_num_seqs>1) prefill: prefill each request in this step into its decode slot.
 
         vLLM prefills new requests while other slots decode, so each user's B=1 state is written into
@@ -443,30 +473,36 @@ class Qwen36ForCausalLM(Generator, SupportsMultiModal):
         token_ids_list = [tokens[u : u + 1, : plens[u]].to(torch.int32) for u in range(N)]
         pt = page_table if isinstance(page_table, torch.Tensor) else ttnn.to_torch(page_table)
         logger.info(f"Prefilling {N} user(s) into slots {empty_slots} (TP batched masked-bucket)")
-        starts = [] if start_pos is None else [int(s) for s in start_pos]
-        if not any(s > 0 for s in starts):
-            logger.info("[M1] prefill path: one-shot prefill_paged_slots")
-            host_logits = model.prefill_paged_slots(token_ids_list, pt, empty_slots, valid_lens=plens)
-            if starts:
-                # Where the range path has to pick up. Chunk one runs here by
-                # design and prefill_paged_slots never touches the cursor, so
-                # without this the FIRST continuation sees None and refuses -
-                # run 35692388798, resumed at 2048 with the scratch at None.
-                # plens[0] is the end of the range just covered, and on an
-                # unchunked prompt no continuation ever reads it.
-                model._qwen_lever_n_next_start = int(plens[0])
+        if _QWEN_PREFIX_REUSE:
+            # start_pos is the runner's num_computed_tokens: Q on a committed hit, else 0.
+            host_logits = model._qwen_prefix_prefill_slots(
+                token_ids_list, pt, empty_slots, valid_lens=plens, starts=start_pos, req_ids=req_ids
+            )
         else:
-            # A continuation. model_runner.submit_prefill always supplies start_pos,
-            # so its presence says nothing; a nonzero start is what marks a resumed
-            # prompt. The first chunk stays on the one-shot path, where it is
-            # equivalent: its end is chunk-aligned so tail_real is 0 and no tail runs.
-            logger.info(
-                f"[M1] prefill path: resumable prefill_paged_slots_range "
-                f"starts={starts} ends={list(plens)}"
-            )
-            host_logits = model.prefill_paged_slots_range(
-                token_ids_list, pt, empty_slots, starts, plens, valid_lens=plens
-            )
+            starts = [] if start_pos is None else [int(s) for s in start_pos]
+            if not any(s > 0 for s in starts):
+                logger.info("[M1] prefill path: one-shot prefill_paged_slots")
+                host_logits = model.prefill_paged_slots(token_ids_list, pt, empty_slots, valid_lens=plens)
+                if starts:
+                    # Where the range path has to pick up. Chunk one runs here by
+                    # design and prefill_paged_slots never touches the cursor, so
+                    # without this the FIRST continuation sees None and refuses -
+                    # run 35692388798, resumed at 2048 with the scratch at None.
+                    # plens[0] is the end of the range just covered, and on an
+                    # unchunked prompt no continuation ever reads it.
+                    model._qwen_lever_n_next_start = int(plens[0])
+            else:
+                # A continuation. model_runner.submit_prefill always supplies start_pos,
+                # so its presence says nothing; a nonzero start is what marks a resumed
+                # prompt. The first chunk stays on the one-shot path, where it is
+                # equivalent: its end is chunk-aligned so tail_real is 0 and no tail runs.
+                logger.info(
+                    f"[M1] prefill path: resumable prefill_paged_slots_range "
+                    f"starts={starts} ends={list(plens)}"
+                )
+                host_logits = model.prefill_paged_slots_range(
+                    token_ids_list, pt, empty_slots, starts, plens, valid_lens=plens
+                )
         logits = torch.cat([hl.reshape(1, 1, -1) for hl in host_logits], dim=0)  # [N, 1, vocab]
         logger.info(f"Finished batched prefill of {N} user(s), starting decode...")
         return logits, torch.zeros(N, dtype=torch.long)
@@ -482,7 +518,7 @@ class Qwen36ForCausalLM(Generator, SupportsMultiModal):
         # BEFORE the decode trace reads it. The plugin remaps its own buffers (and the seed RNG via
         # super().decode_forward), but GDN state is model-internal, so mirror the same reindex here.
         # slot_remap is passed through unchanged so the seed-RNG remap inside super() still runs.
-        if model.use_tp and model.args.max_batch_size > 1:
+        if getattr(model, "use_tp", model.num_devices > 1) and model.args.max_batch_size > 1:
             slot_remap = kwargs.get("slot_remap")
             if slot_remap is not None:
                 model._remap_gdn_slots(slot_remap)
@@ -542,6 +578,8 @@ class Qwen36ForCausalLM(Generator, SupportsMultiModal):
     def warmup_model_prefill(self, kv_cache, enable_trace, *args, **kwargs):
         # Capture the chunk-prefill trace + warm the masked-bucket set so requests only replay
         # pre-compiled programs (compile-clobbers-trace fix). Guard name must match the plugin's reset.
+        if _QWEN_PREFIX_REUSE:
+            self._qwen_prefix_warm()
         if not enable_trace:
             return
         if getattr(self, "already_warmed_up_prefill", False):
@@ -561,7 +599,7 @@ class Qwen36ForCausalLM(Generator, SupportsMultiModal):
         # (>chunk_size) replay the traced chunk-outer path per user instead of the slower eager fallback.
         # The scratch is not freed (prefill_paged_slots rebinds it per request); the batched decode
         # buffers are restored before the decode-trace warmup captures at [B,...].
-        batched = model.use_tp and model.args.max_batch_size > 1
+        batched = getattr(model, "use_tp", model.num_devices > 1) and model.args.max_batch_size > 1
         logger.info(
             f"Starting Qwen prefill warmup: chunk-prefill trace{' (batched, B=1 scratch)' if batched else ''} "
             f"(chunk={_PREFILL_WARMUP_CHUNK}, page_table_blocks={num_blocks})..."
@@ -583,9 +621,76 @@ class Qwen36ForCausalLM(Generator, SupportsMultiModal):
         # the transient prefill activations, is the headroom QWEN36_MAX_TOKENS_ALL_USERS can grow into.
         _log_device_memory(self.mesh_device, "after prefill warmup")
 
+    def _qwen_prefix_warm(self):
+        """QWEN_PREFIX_REUSE: choose and compile the GDN restore path before any trace is parked (F3).
+
+        Runs on the first warmup_model_prefill call, which the plugin makes in its compile-only
+        phase (enable_trace=False, before any trace capture), so it precedes the chunk trace on the
+        traced path and the decode trace on both. Once per model: keyed on the restore mode the
+        model itself holds, so a model that has not chosen one is always warmed here."""
+        model = self.model[0]
+        if getattr(model, "_qwen_prefix_restore_mode", None) is not None:
+            return
+        if not (model.num_devices > 1 and model.args.max_batch_size > 1):
+            logger.warning(
+                "[PINDIAG] prefix: model warm skipped - not the batched TP path "
+                f"(num_devices={model.num_devices}, max_batch_size={model.args.max_batch_size}); "
+                "a resumed row will assert"
+            )
+            return
+        prev = model._bind_gdn_prefill_scratch()
+        try:
+            model._qwen_prefix_warm_restore()
+        finally:
+            model._unbind_gdn_prefill_scratch(prev)
+
     def warmup_model_decode(self, *args, **kwargs):
         # Defer to WarmupForwardMixin, which warms the paged-SDPA + GDN decode path at pos 0.
         # Drop stale `non_greedy_decoding_on_device` from the old vLLM plugin; no-op for Qwen.
         kwargs.pop("non_greedy_decoding_on_device", None)
         self._validate_device_sampling_request(kwargs.get("can_sample_on_device", False))
+        if _QWEN_PREFIX_REUSE and kwargs.get("enable_trace"):
+            # The first trace trace_mode decode_only parks: warm the eager prefill before it.
+            self._qwen_prefix_warm_eager(kwargs.get("kv_cache"))
         return warmup_decode_buckets(self, super().warmup_model_decode, *args, **kwargs)
+
+    def _qwen_prefix_warm_eager(self, kv_cache):
+        """QWEN_PREFIX_REUSE under trace_mode decode_only: compile the eager prefill before the first
+        trace is parked (F3).
+
+        The plugin compiles prefill only through warmup_model_prefill, which returns at once without a
+        trace, and decode_only never makes its traced call: the route's first request then compiled
+        the whole eager chunk loop after the decode traces were parked (133 programs, G1 v47, run
+        36246961161) and the next prefill hung the device - an MMIO per-op timeout inside
+        forward_prefill_paged, the second-request hang (#48536). warmup_model_decode's traced call is
+        the first capture this mode makes, so this runs just before it: once per model, and only when
+        no chunk trace was captured (trace_mode all warmed the prefill in that capture). It is the
+        model's own warm without a capture, capture_prefill_trace_chunked(capture_chunk_trace=False):
+        the chunk program, every masked bucket masked and full (the eager loop's full chunk is bucket
+        2048 full, its tail a masked bucket) and every paged-fill width, against the bound B=1 scratch
+        at warmup_model_prefill's chunk-trace page-table width - the buffer it allocates at that width
+        is what _qwen_prefix_prefill_slots fits the eager loop's page table to."""
+        model = self.model[0]
+        if getattr(model, "_chunked_trace_id", None) is not None or getattr(model, "_qwen_prefix_eager_warmed", False):
+            return
+        if not (model.num_devices > 1 and model.args.max_batch_size > 1):
+            return
+        # warmup_model_prefill's chunk-trace page table: the whole KV cache, rounded up to 32 blocks.
+        if kv_cache:
+            num_blocks = math.ceil(int(kv_cache[0][0].shape[0]) / 32) * 32
+        else:
+            num_blocks = math.ceil(_PREFILL_WARMUP_BUCKET / _BLOCK_SIZE)
+        page_table = torch.arange(num_blocks, dtype=torch.int32).reshape(1, num_blocks)
+        before = model._qwen_prefix_program_cache_entries()
+        prev = model._bind_gdn_prefill_scratch()
+        try:
+            model.capture_prefill_trace_chunked(
+                self.mesh_device, page_table, chunk_size=_PREFILL_WARMUP_CHUNK, capture_chunk_trace=False
+            )
+        finally:
+            model._unbind_gdn_prefill_scratch(prev)
+        model._qwen_prefix_eager_warmed = True
+        logger.info(
+            f"[PINDIAG] prefix: eager prefill warmed before the decode trace: page_table_blocks={num_blocks} "
+            f"programs={before}->{model._qwen_prefix_program_cache_entries()}"
+        )
