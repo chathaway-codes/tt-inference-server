@@ -6,10 +6,11 @@ CONTAINER_NAME="qwen-dflash-test"
 # Remove existing test container if present
 docker rm -f "$CONTAINER_NAME" 2>/dev/null || true
 
-echo "Starting test container $CONTAINER_NAME with GDN Prefix Caching and Sticky Sessions..."
+echo "Starting container $CONTAINER_NAME with GDN Prefix Caching, Sticky Sessions, and RAGGED=1 (Restart: unless-stopped)..."
 
 docker run -d \
   --name "$CONTAINER_NAME" \
+  --restart unless-stopped \
   --user 1000:1000 \
   --workdir /home/tt/work \
   --ipc host \
@@ -31,6 +32,7 @@ docker run -d \
   -e DFLASH_WEIGHTS="incoai/Qwen3.8-27B-DFlash2@dedf8df68adfb1afeaf7b7480c0a0243108177b4" \
   -e QWEN36_DRAFTER="dflash2" \
   -e QWEN36_DFLASH_SERVE_BLOCK="32" \
+  -e QWEN36_DFLASH_RAGGED="1" \
   -e QWEN36_DFLASH_FOLD_SEED="1" \
   -e QWEN36_SKIP_VISION="1" \
   -e VLLM_RPC_TIMEOUT="900000" \
@@ -66,4 +68,4 @@ docker run -d \
   --port 8000 \
   --additional-config '{"tt": {"l1_small_size": 24576, "fabric_config": "FABRIC_1D", "trace_region_size": 1073741824, "sample_on_device_mode": "decode_only"}}'
 
-echo "Container launched with Prefix Caching."
+echo "Container launched with Prefix Caching and RAGGED=1."
